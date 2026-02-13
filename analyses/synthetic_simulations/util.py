@@ -533,6 +533,7 @@ def get_pseudobulks_and_degs(
     if observed_non_control_ids.size == 0:
         raise ValueError("No perturbation groups found (labels other than -1).")
 
+    # Determine expected perturbation IDs based on n_degs_per_pert or observed data
     if n_degs_per_pert is not None:
         expected_pert_ids = np.arange(len(n_degs_per_pert), dtype=np.int32)
     else:
@@ -642,6 +643,9 @@ def get_pseudobulks_and_degs(
                 deg_mask = _topk_mask(pvals_adj, n_degs_per_pert[pert_id_int])
             else:
                 deg_mask = pvals_adj < float(alpha)
+                if deg_mask.sum() == 0:
+                    # If no DEGs pass the threshold, take the single most significant gene to avoid empty DEG sets.
+                    deg_mask[np.argmin(pvals_adj)] = True
             degs.append(deg_mask)
 
         return mu_control, mu_pooled, degs

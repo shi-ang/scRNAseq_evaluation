@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import math
 from dataclasses import dataclass
 from typing import Tuple, List
@@ -9,9 +8,8 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 import scipy.sparse.linalg as spla
-import anndata as ad
 
-from .util import _normalize_and_log1p
+from .util import ChunkedAnnDataWriter
 
 
 def _softplus(x: np.ndarray) -> np.ndarray:
@@ -257,7 +255,7 @@ def synthetic_causalDGP(
     max_cells_per_chunk=2048,
     normalize=True, # Whether to normalize before log1p for the persisted layer
     normalized_layer_key: str = "normalized_log1p", # Layer name for normalized/log1p values
-) -> Tuple[list[str], list[np.ndarray]]:
+) -> list[str]:
     """
     End-to-end synthetic scRNA-seq generator:
 
@@ -273,7 +271,6 @@ def synthetic_causalDGP(
 
     Returns:
       - chunk_paths: list[str]
-      - all_affected_masks: list[np.ndarray] length P, each bool mask of shape (G,)
     """
     # ---- RNG ----
     if trial_id_for_rng is None:
@@ -281,11 +278,8 @@ def synthetic_causalDGP(
     else:
         rng = np.random.default_rng(trial_id_for_rng)
 
-    # TODO: add parameter preparation
-
     if output_dir is None:
         raise ValueError("output_dir must be provided.")
-    os.makedirs(output_dir, exist_ok=True)
 
     # defaults pi / eta
     if pi is None:
@@ -325,13 +319,11 @@ def synthetic_causalDGP(
     targets = rng.choice(G, size=P, replace=False).astype(np.int64)
     shifts = _unif_pm(rng, 5.0, 15.0, size=P).astype(np.float32)
 
-    all_affected_masks: list[np.ndarray] = []
     for p in range(P):
         m = np.zeros(G, dtype=bool)
         m[int(targets[p])] = True
-        all_affected_masks.append(m)
 
-    # For speed, store bc vectors as (b + c_q) without materializing full c_q repeatedly.
+    # store bc vectors as (b + c_q) without materializing full c_q repeatedly.
     # bc_control = b
     bc_list = []
     bc_list.append(b.copy())  # index 0 corresponds to control bc (q=-1)
@@ -340,57 +332,22 @@ def synthetic_causalDGP(
         bc[int(targets[p])] += float(shifts[p])
         bc_list.append(bc)
 
-    # ---- var (genes) ----
     var = pd.DataFrame(index=pd.Index([f"gene_{i}" for i in range(G)], name="gene"))
 
-    # Buffer small batches
-    buffer_X: list[sparse.csr_matrix] = []
-    buffer_labels = []
-    buffer_rows = 0
-    chunk_paths: list[str] = []
-    chunk_idx = 0
+    writer = ChunkedAnnDataWriter(
+        output_dir=output_dir,
+        var=var,
+        max_cells_per_chunk=max_cells_per_chunk,
+        normalize=normalize,
+        normalized_layer_key=normalized_layer_key,
+    )
 
-    def flush_buffer():
-        nonlocal buffer_X, buffer_labels, buffer_rows, chunk_idx
-        if buffer_rows == 0:
-            return
-        # Persist one sparse chunk to disk and clear in-memory buffers.
-        chunk_counts = sparse.vstack(buffer_X, format="csr", dtype=np.int32)
-        chunk_labels = np.concatenate(buffer_labels).astype(np.int32, copy=False)
-        obs = pd.DataFrame(
-            {"perturbation": chunk_labels},
-            index=[f"cell_{chunk_idx}_{i}" for i in range(chunk_counts.shape[0])],
-        )
-        chunk_adata = ad.AnnData(X=chunk_counts, obs=obs, var=var)
-        chunk_adata.layers[normalized_layer_key] = _normalize_and_log1p(chunk_counts, normalize=normalize)
-        chunk_path = os.path.join(output_dir, f"synthetic_chunk_{chunk_idx:06d}.h5ad")
-        chunk_adata.write_h5ad(chunk_path, compression="gzip")
-        chunk_paths.append(chunk_path)
-
-        buffer_X = []
-        buffer_labels = []
-        buffer_rows = 0
-        chunk_idx += 1
-
-    def append_counts(counts_block, perturbation_id):
-        nonlocal buffer_rows
-        if counts_block.size == 0:
-            return
-        # perturbation_id == -1 is reserved for control cells.
-        buffer_X.append(counts_block.astype(np.int32, copy=False))
-        buffer_labels.append(np.full(counts_block.shape[0], perturbation_id, dtype=np.int32))
-        buffer_rows += counts_block.shape[0]
-        if buffer_rows >= max_cells_per_chunk:
-            flush_buffer()
-
-    # ---- sampling hyperparameters (tune as needed) ----
-    # These are not specified by the paper for the linear simulation; EM is your requested choice.
+    # EM sampling parameters
     dt = 1e-4
     burn_in_steps = 200
     thinning_steps = 20
     chains_default = 64  # number of parallel chains per condition
 
-    # ---- Generate conditions sequentially ----
     # condition order: control (-1), then perturbations 0..P-1
     conditions = [(-1, N0, 0)] + [(p, Nk, p + 1) for p in range(P)]  # (label, n_cells, bc_index)
 
@@ -410,18 +367,18 @@ def synthetic_causalDGP(
         remaining = n_cells
         while remaining > 0:
             # how many cells can we add before flushing?
-            space = max_cells_per_chunk - buffer_rows
+            space = max_cells_per_chunk - writer.buffer_rows
             if space <= 0:
-                flush_buffer()
+                writer.flush()
                 continue
 
             current_batch_size = min(remaining, space)
             x_batch = sampler.draw(current_batch_size)                  # (batch_n, G) latent
             y_batch = _sample_zip_counts(x_batch, pi=pi, eta=eta, rng=rng)  # (batch_n, G)
 
-            append_counts(y_batch, perturbation_id=label)
+            writer.append_counts(y_batch, perturbation_id=label)
             remaining -= current_batch_size
-        print(f"Finished condition {label} with {n_cells} cells.")
+
     # flush tail
-    flush_buffer()
-    return chunk_paths, all_affected_masks
+    writer.flush()
+    return writer.chunk_paths

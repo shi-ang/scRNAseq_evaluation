@@ -45,7 +45,6 @@ def evaluation(
         mu_control_obs,
         mu_pool_obs,
         DEGs_stats,
-        DEGs_by_DGP,
         model: str = "Average",
 ):
     """
@@ -58,7 +57,6 @@ def evaluation(
     :param mu_control_obs: observed mean expression matrix for control, shape (n_genes)
     :param mu_pool_obs: observed mean expression matrix for pooled data, shape (n_perturbations, n_genes)
     :param DEGs_stats: list of differentially expressed genes masks for each perturbation, from statistical testing
-    :param DEGs_by_DGP: list of masks indicating affected genes for each perturbation, from data generation process
     :param model: The prediction model used, affects certain calculations
     """
     n_genes = mu_obs.shape[1]
@@ -85,90 +83,69 @@ def evaluation(
         pred_effects=mu_pred - mu_control_obs,
         metric="cosine",
     )
-
-    # get genes which were affected by ANY perturbation for fraction calculation
-    any_affected_calculate = np.zeros(n_genes, dtype=bool)
-    if DEGs_by_DGP:
-        for DEGs in DEGs_by_DGP:
-            any_affected_calculate = np.logical_or(any_affected_calculate, DEGs)
     
     results_tracker = {
         'pearson_all': [],
-        'pearson_affected': [],
         'pearson_degs': [],
         'mae_all': [],
-        'mae_affected': [],
         'mae_degs': [],
         'mse_all': [],
-        'mse_affected': [],
         'mse_degs': [],
         'r2_all': [],
-        'r2_affected': [],
         'r2_degs': [],
     }
     # Calculate metrics per perturbation
     # "_all" is for all genes
-    # "_affected" is for the genes that were truly affected in the simulation (like true DEGs)
     # "_degs" is for the genes identified as DEGs by the t-test (statistical DEGs)
     for ptb_idx in range(n_perts):
-        DEGs_by_DGP_ptb = DEGs_by_DGP[ptb_idx]
         DEGs_stats_ptb = DEGs_stats[ptb_idx]
         
         mu_obs_ptb = mu_obs[ptb_idx].astype(np.float32)
         mu_pred_ptb = mu_pred[ptb_idx].astype(np.float32)
         if model != "Control":
             results_tracker['pearson_all'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs))
-            results_tracker['pearson_affected'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, DEGs=DEGs_by_DGP_ptb))
             results_tracker['pearson_degs'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, DEGs=DEGs_stats_ptb))
 
         results_tracker['mae_all'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute"))
         results_tracker['mse_all'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared"))
-        results_tracker['mae_affected'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute", weights=DEGs_by_DGP_ptb.astype(np.float32))) 
-        results_tracker['mse_affected'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared", weights=DEGs_by_DGP_ptb.astype(np.float32)))
         results_tracker['mae_degs'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute", weights=DEGs_stats_ptb.astype(np.float32)))
         results_tracker['mse_degs'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared", weights=DEGs_stats_ptb.astype(np.float32)))
 
         results_tracker['r2_all'].append(r2_score_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs))
-        results_tracker['r2_affected'].append(r2_score_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, weights=DEGs_by_DGP_ptb.astype(np.float32)))
         results_tracker['r2_degs'].append(r2_score_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, weights=DEGs_stats_ptb.astype(np.float32)))
 
     results_final = {
         'pearson_all_median': np.nanmedian(results_tracker['pearson_all']) if results_tracker['pearson_all'] else np.nan,
-        'pearson_affected_median': np.nanmedian(results_tracker['pearson_affected']) if results_tracker['pearson_affected'] else np.nan,
         'pearson_degs_median': np.nanmedian(results_tracker['pearson_degs']) if results_tracker['pearson_degs'] else np.nan,
         'mae_all_median': np.nanmedian(results_tracker['mae_all']) if results_tracker['mae_all'] else np.nan,
-        'mae_affected_median': np.nanmedian(results_tracker['mae_affected']) if results_tracker['mae_affected'] else np.nan,
         'mae_degs_median': np.nanmedian(results_tracker['mae_degs']) if results_tracker['mae_degs'] else np.nan,
         'mse_all_median': np.nanmedian(results_tracker['mse_all']) if results_tracker['mse_all'] else np.nan,
-        'mse_affected_median': np.nanmedian(results_tracker['mse_affected']) if results_tracker['mse_affected'] else np.nan,
         'mse_degs_median': np.nanmedian(results_tracker['mse_degs']) if results_tracker['mse_degs'] else np.nan,
         'pds_l1': pds_l1_score,
         'pds_l2': pds_l2_score,
         'pds_cosine': pds_cosine_score,
-        'fraction_genes_affected': any_affected_calculate.mean() if n_genes > 0 and hasattr(any_affected_calculate, 'size') and any_affected_calculate.size == n_genes and any_affected_calculate.dtype == bool else np.nan,
         'r2_all_median': np.nanmedian(results_tracker['r2_all']) if results_tracker['r2_all'] else np.nan,
-        'r2_affected_median': np.nanmedian(results_tracker['r2_affected']) if results_tracker['r2_affected'] else np.nan,
         'r2_degs_median': np.nanmedian(results_tracker['r2_degs']) if results_tracker['r2_degs'] else np.nan,
     }
     return results_final
 
 
 def simulate_one_run(
-    dataset_name,
-    G=10_000,   # number of genes
-    N0=3_000,   # number of control cells
-    Nk=150,     # number of perturbed cells per perturbation
-    P=50,       # number of perturbations
-    p_effect=0.01,  # a threshold for fraction of genes affected per perturbation
-    effect_factor=2.0,  # effect factor for affected genes, epsilon in the paper
-    B=0.0,      # global perturbation bias factor, beta in the paper
-    mu_l=1.0,   # mean of log library size
-    all_theta=None, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
-    control_mu=None, # Control mu parameters, size of total number of genes in the real dataset (>= G)
-    pert_mu=None, # Perturbed mu parameters, size of total number of genes in the real dataset (>= G)
-    trial_id_for_rng=None, # Optional for seeding RNG per trial,
-    model="Average", # The prediction model to use
-    normalize=True, # Whether to normalize the data
+    dataset_name: str,
+    G: int=10_000,   # number of genes
+    N0: int=3_000,   # number of control cells
+    Nk: int=150,     # number of perturbed cells per perturbation
+    P: int=50,       # number of perturbations
+    p_effect: float=0.01,  # a threshold for fraction of genes affected per perturbation
+    effect_factor: float=2.0,  # effect factor for affected genes, epsilon in the paper
+    B: float=0.0,      # global perturbation bias factor, beta in the paper
+    mu_l: float=1.0,   # mean of log library size
+    all_theta: np.ndarray | None = None, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
+    control_mu: np.ndarray | None = None, # Control mu parameters, size of total number of genes in the real dataset (>= G)
+    pert_mu: np.ndarray | None = None, # Perturbed mu parameters, size of total number of genes in the real dataset (>= G)
+    trial_id_for_rng: int | None = None, # Optional for seeding RNG per trial,
+    model: str="Average", # The prediction model to use
+    normalize: bool=True, # Whether to normalize the data
     max_cells_per_chunk: int=2048, # Count-generation chunk size
     ann_batch_size: int=1024, # AnnCollection batch size for scanpy processing
 ):
@@ -180,7 +157,7 @@ def simulate_one_run(
     # The directory and its contents will be deleted after use
     with tempfile.TemporaryDirectory(prefix=f"synthetic_trial_{trial_id_for_rng}_", dir="/tmp") as tmp_dir:
         if dataset_name == "synthetic_one":
-            chunk_paths, true_DEGs_generated = synthetic_DGP(
+            chunk_paths, _ = synthetic_DGP(
                 G=G,
                 N0=N0,
                 Nk=Nk,
@@ -199,7 +176,7 @@ def simulate_one_run(
                 normalized_layer_key=_NORM_LAYER_KEY,
             )
         elif dataset_name == "synthetic_two":
-            chunk_paths, true_DEGs_generated = synthetic_causalDGP(
+            chunk_paths = synthetic_causalDGP(
                 G=G,
                 N0=N0,
                 Nk=Nk,
@@ -352,7 +329,6 @@ def simulate_one_run(
         ac_train = collection[train_idx]
         ac_test = collection[test_idx]
 
-        n_degs_per_pert = [int(true_DEGs.sum()) for true_DEGs in true_DEGs_generated]
         mu_control_train, mu_pool_train, _ = get_pseudobulks_and_degs(
             ac_view=ac_train,
             ac_batch_size=ann_batch_size,
@@ -364,7 +340,6 @@ def simulate_one_run(
             ac_view=ac_test,
             ac_batch_size=ann_batch_size,
             return_degs=True,
-            n_degs_per_pert=n_degs_per_pert,
             alpha=p_effect,
             method="t-test",
             layer_key=_NORM_LAYER_KEY,
@@ -390,7 +365,6 @@ def simulate_one_run(
                 mu_control_obs=mu_control_test,
                 mu_pool_obs=mu_pool_test,
                 DEGs_stats=degs_test,
-                DEGs_by_DGP=true_DEGs_generated,
                 model=model,
             )
             model_results.update({
@@ -465,12 +439,11 @@ def _pool_worker_timed(task_info_dict):
     except Exception as e:
         # Define metrics_error_keys locally for safety
         metrics_error_keys_local = { 
-            'pearson_all_median', 'pearson_affected_median', 'pearson_degs_median',
-            'mae_all_median', 'mae_affected_median', 'mae_degs_median',
-            'mse_all_median', 'mse_affected_median', 'mse_degs_median',
-            'r2_all_median', 'r2_affected_median', 'r2_degs_median',
+            'pearson_all_median', 'pearson_degs_median',
+            'mae_all_median', 'mae_degs_median',
+            'mse_all_median', 'mse_degs_median',
+            'r2_all_median', 'r2_degs_median',
             'pds_l1', 'pds_l2', 'pds_cosine',
-            'fraction_genes_affected', 
             'model', 'execution_time',
             'sparsity', 'median_library_size', 'systematic_variation', 'intra_corr', 'vendi_score',
         }
@@ -558,12 +531,12 @@ def run_random_sweep(
         failed_trials = results_df[results_df['status'] == 'failed']
         # Define metrics_error keys for excluding them from params logging
         metrics_error_keys = { 
-            'pearson_all_median', 'pearson_affected_median', 'pearson_degs_median',
-            'mae_all_median', 'mae_affected_median', 'mae_degs_median',
-            'mse_all_median', 'mse_affected_median', 'mse_degs_median',
-            'r2_all_median', 'r2_affected_median', 'r2_degs_median',
+            'pearson_all_median', 'pearson_degs_median',
+            'mae_all_median', 'mae_degs_median',
+            'mse_all_median', 'mse_degs_median',
+            'r2_all_median', 'r2_degs_median',
             'pds_l1', 'pds_l2', 'pds_cosine',
-            'fraction_genes_affected', 'sparsity', 'vendi_score'
+            'sparsity', 'vendi_score'
         }
         with open(error_log_file, 'a') as f:
             for _, row in failed_trials.iterrows():
@@ -599,7 +572,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--max_cells_per_chunk", type=int, default=2048, help="Maximum cells per generated h5ad chunk")
     parser.add_argument("--ann_batch_size", type=int, default=1024, help="Batch size when iterating AnnCollection")
-    parser.add_argument("--dataset", type=str, choices=["synthetic_one", "synthetic_two"], default="synthetic_two", help="Dataset to use for the simulation")
+    parser.add_argument("--dataset", type=str, default="synthetic_two", choices=["synthetic_one", "synthetic_two"], help="Dataset to use for the simulation")
     args = parser.parse_args()
 
     # Set seed

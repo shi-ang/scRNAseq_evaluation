@@ -1,9 +1,3 @@
-## Pearson delta vs control bias
-## Pearson delta vs n0
-## Pearson delta affected genes vs # perturbations
-# Figsize (7, 6)
-# Fontsize 14 (xy labels), 16 (title)
-
 import os
 import pandas as pd
 import numpy as np
@@ -308,20 +302,12 @@ def main():
         # Define save paths for all plots
         plot_dir = 'results/synthetic_simulations/paper_plots'
         os.makedirs(plot_dir, exist_ok=True)
-        
-        control_bias_path = os.path.join(plot_dir, 'pearson_delta_vs_control_bias.pdf')
-        n0_path = os.path.join(plot_dir, 'pearson_delta_vs_n0.pdf')
-        perturbations_path = os.path.join(plot_dir, 'pearson_delta_affected_vs_perturbations.pdf')
-        pds_metrics = [metric for metric in ('pds_cosine', 'pds_l2', 'pds_l1') if metric in data.columns]
-        if not pds_metrics:
-            raise ValueError("No PDS metric columns found in results (expected pds_cosine, pds_l2, or pds_l1).")
-        mse_p_effect_path = os.path.join(plot_dir, 'mse_vs_p_effect.pdf')
-        
+                
         # Generate all plots
         # Plot Pearson delta vs control bias (β)
         plot_pearson_delta_vs_parameter(
             data=data,
-            save_path=control_bias_path,
+            save_path=os.path.join(plot_dir, 'pearson_delta_vs_control_bias.pdf'),
             x_column='B',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{β}$  $\mathbf{(Simulation)}$',
             x_label='Control Bias (β)',
@@ -331,7 +317,7 @@ def main():
         # Plot Pearson delta vs n0
         plot_pearson_delta_vs_parameter(
             data=data,
-            save_path=n0_path,
+            save_path=os.path.join(plot_dir, 'pearson_delta_vs_n0.pdf'),
             x_column='N0',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{n_0}$ $\mathbf{(Simulation)}$',
             x_label='Number of Control Cells ($n_0$)',
@@ -342,9 +328,9 @@ def main():
         # Plot Pearson delta (affected genes) vs number of perturbations.
         plot_pearson_delta_vs_parameter(
             data=data,
-            save_path=perturbations_path,
+            save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_perturbations.pdf'),
             x_column='P',
-            y_column='pearson_affected_median',
+            y_column='pearson_degs_median',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{k}$ $\mathbf{(Simulation)}$',
             x_label='Number of Perturbations ($k$)',
             y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
@@ -396,7 +382,7 @@ def main():
             log_x=False,
             corr_log_x=False,
         )
-        for pds_metric in pds_metrics:
+        for pds_metric in ['pds_cosine', 'pds_l2', 'pds_l1']:
             # Plot PDS vs control bias (β)
             plot_pds_vs_parameter(
                 data=data,
@@ -497,7 +483,7 @@ def main():
         # Plot MSE vs p_effect (fraction of genes affected)
         plot_metric_vs_parameter(
             data=data,
-            save_path=mse_p_effect_path,
+            save_path=os.path.join(plot_dir, 'mse_vs_p_effect.pdf'),
             x_column='p_effect',
             y_column='mse_all_median',
             title=r'$\mathbf{MSE}$ $\mathbf{(Simulation)}$',
@@ -505,7 +491,6 @@ def main():
             y_label='MSE',
             window=window,
         )
-        
 
         print(f"Successfully generated all plots from {args.results}")
     except Exception as e:
