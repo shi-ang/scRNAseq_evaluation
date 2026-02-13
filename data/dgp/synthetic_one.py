@@ -66,10 +66,9 @@ def synthetic_DGP(
       - all_affected_masks: list[np.ndarray], one mask per perturbation
     """
     if trial_id_for_rng is None:
-        # TODO: change this to default_rng, check if downstream code is compatible with Generator instead of RandomState
-        rng = np.random.RandomState(42)
+        rng = np.random.default_rng(42)
     else:
-        rng = np.random.RandomState(trial_id_for_rng)
+        rng = np.random.default_rng(trial_id_for_rng)
     
     # --- Parameter Preparation with assertions ---
     # Assert that control_mu, pert_mu, and all_theta are provided
