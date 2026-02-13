@@ -17,7 +17,7 @@ from metrics.perturbation_effect.pearson import pearson_pert
 from metrics.perturbation_effect.perturbation_discrimination_score import compute_pds
 from metrics.perturbation_effect.r_square import r2_score_pert
 from metrics.reconstruction.mean_error import mean_error_pert
-from dgp.synthetic_one import synthetic_DGP
+from data.dgp import synthetic_DGP, synthetic_causalDGP
 
 # Set OpenBLAS threads early if it was found to be helpful, otherwise optional
 # os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -154,6 +154,7 @@ def evaluation(
 
 
 def simulate_one_run(
+    dataset_name,
     G=10_000,   # number of genes
     N0=3_000,   # number of control cells
     Nk=150,     # number of perturbed cells per perturbation
@@ -178,25 +179,40 @@ def simulate_one_run(
     # Setup temporary directory for chunked data
     # The directory and its contents will be deleted after use
     with tempfile.TemporaryDirectory(prefix=f"synthetic_trial_{trial_id_for_rng}_", dir="/tmp") as tmp_dir:
-        chunk_paths, true_DEGs_generated = synthetic_DGP(
-            G=G,
-            N0=N0,
-            Nk=Nk,
-            P=P,
-            p_effect=p_effect,
-            effect_factor=effect_factor,
-            B=B,
-            mu_l=mu_l,
-            all_theta=all_theta,
-            control_mu=control_mu,
-            pert_mu=pert_mu,
-            trial_id_for_rng=trial_id_for_rng,
-            output_dir_for_chunks=tmp_dir,
-            max_cells_per_chunk=max_cells_per_chunk,
-            normalize=normalize,
-            normalized_layer_key=_NORM_LAYER_KEY,
-        )
-
+        if dataset_name == "synthetic_one":
+            chunk_paths, true_DEGs_generated = synthetic_DGP(
+                G=G,
+                N0=N0,
+                Nk=Nk,
+                P=P,
+                p_effect=p_effect,
+                effect_factor=effect_factor,
+                B=B,
+                mu_l=mu_l,
+                all_theta=all_theta,
+                control_mu=control_mu,
+                pert_mu=pert_mu,
+                trial_id_for_rng=trial_id_for_rng,
+                output_dir=tmp_dir,
+                max_cells_per_chunk=max_cells_per_chunk,
+                normalize=normalize,
+                normalized_layer_key=_NORM_LAYER_KEY,
+            )
+        elif dataset_name == "synthetic_two":
+            chunk_paths, true_DEGs_generated = synthetic_causalDGP(
+                G=G,
+                N0=N0,
+                Nk=Nk,
+                P=P,
+                mask_method='Erdos-Renyi',
+                trial_id_for_rng=trial_id_for_rng,
+                output_dir=tmp_dir,
+                max_cells_per_chunk=max_cells_per_chunk,
+                normalize=normalize,
+                normalized_layer_key=_NORM_LAYER_KEY,
+            )
+        else:
+            raise ValueError(f"Unsupported dataset_name: {dataset_name}")
         # Memmaps keep large (P x G) accumulators off RAM while still supporting ndarray ops.
         # pert_sum is the sum of expressions for each gene in each perturbation, used to calculate means.
         # pert_sumsq is the sum of squared expressions for each gene in each perturbation, used to calculate variances.
@@ -414,6 +430,7 @@ def init_worker(control_mu, all_theta, pert_mu):
 
 # Revised _pool_worker to include timing (matches spirit of original)
 def _pool_worker_timed(task_info_dict):
+    dataset_name = task_info_dict['dataset_name']
     trial_id = task_info_dict['trial_id']
     params_dict = task_info_dict['params_dict']
     control_mu_from_main = _GLOBAL["control_mu"]
@@ -422,6 +439,7 @@ def _pool_worker_timed(task_info_dict):
 
     # Add trial_id for RNG seeding within simulate_one_run_numpy
     params_for_sim = params_dict.copy() # Avoid modifying original params_dict
+    params_for_sim['dataset_name'] = dataset_name
     params_for_sim['trial_id_for_rng'] = trial_id
     params_for_sim['control_mu'] = control_mu_from_main
     params_for_sim['all_theta'] = all_theta_from_main
@@ -469,6 +487,7 @@ def _pool_worker_timed(task_info_dict):
 
 
 def run_random_sweep(
+    dataset_name,
     n_trials,
     output_dir,
     control_mu=None,
@@ -496,7 +515,11 @@ def run_random_sweep(
         params = sample_parameters(_PARAM_RANGES)
         params['max_cells_per_chunk'] = int(max_cells_per_chunk)
         params['ann_batch_size'] = int(ann_batch_size)
-        tasks_for_pool.append({'trial_id': i, 'params_dict': params})
+        tasks_for_pool.append({
+            'trial_id': i, 
+            'dataset_name': dataset_name,
+            'params_dict': params
+        })
     # sort tasks by estimated cost in descending order to optimize workload distribution
     tasks_for_pool.sort(key=lambda t: est_cost(t["params_dict"]), reverse=True)
 
@@ -576,6 +599,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--max_cells_per_chunk", type=int, default=2048, help="Maximum cells per generated h5ad chunk")
     parser.add_argument("--ann_batch_size", type=int, default=1024, help="Batch size when iterating AnnCollection")
+    parser.add_argument("--dataset", type=str, choices=["synthetic_one", "synthetic_two"], default="synthetic_two", help="Dataset to use for the simulation")
     args = parser.parse_args()
 
     # Set seed
@@ -600,6 +624,7 @@ if __name__ == "__main__":
     # Call the final version of run_random_sweep
     print("Running the sweep...")
     csv_file = run_random_sweep(
+        args.dataset,
         args.n_trials, 
         args.output_dir, 
         control_mu=main_control_mu_loaded, 

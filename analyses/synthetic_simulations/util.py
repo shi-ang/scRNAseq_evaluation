@@ -10,30 +10,6 @@ from sklearn.decomposition import IncrementalPCA
 from anndata.experimental import AnnCollection
 
 
-def normalize_and_log1p(matrix, normalize=True, target_sum=1e4):
-    """
-    Normalize each cell to target_sum (optional) and apply log1p.
-    Works on dense and sparse matrices.
-    """
-    if sparse.issparse(matrix):
-        out = matrix.tocsr(copy=True).astype(np.float32)
-        if normalize:
-            lib_sizes = np.asarray(out.sum(axis=1)).ravel().astype(np.float32, copy=False)
-            lib_sizes[lib_sizes == 0.0] = 1.0
-            scale = (target_sum / lib_sizes).astype(np.float32, copy=False)
-            out = out.multiply(scale[:, None]).tocsr()
-        out.data = np.log1p(out.data)
-        return out
-
-    out = np.asarray(matrix, dtype=np.float32).copy()
-    if normalize:
-        lib_sizes = out.sum(axis=1, dtype=np.float32)
-        lib_sizes[lib_sizes == 0.0] = 1.0
-        out *= (target_sum / lib_sizes)[:, None]
-    np.log1p(out, out=out)
-    return out
-
-
 def est_cost(params):
     """
     Estimate cost for the computation, based on the number of cells and genes.

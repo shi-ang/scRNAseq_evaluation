@@ -1,35 +1,14 @@
 import os
+from typing import Tuple, List
 import numpy as np
 from scipy import sparse
 import pandas as pd
 import anndata as ad
 
-
-def _normalize_and_log1p(matrix, normalize=True, target_sum=1e4):
-    """
-    Normalize each cell to target_sum and apply log1p.
-    Works on dense and sparse matrices.
-    """
-    if sparse.issparse(matrix):
-        out = matrix.tocsr(copy=True).astype(np.float32)
-        if normalize:
-            lib_sizes = np.asarray(out.sum(axis=1)).ravel().astype(np.float32, copy=False)
-            lib_sizes[lib_sizes == 0.0] = 1.0
-            scale = (target_sum / lib_sizes).astype(np.float32, copy=False)
-            out = out.multiply(scale[:, None]).tocsr()
-        out.data = np.log1p(out.data)
-        return out
-
-    out = np.asarray(matrix, dtype=np.float32).copy()
-    if normalize:
-        lib_sizes = out.sum(axis=1, dtype=np.float32)
-        lib_sizes[lib_sizes == 0.0] = 1.0
-        out *= (target_sum / lib_sizes)[:, None]
-    np.log1p(out, out=out)
-    return out
+from .util import _normalize_and_log1p
 
 
-def nb_cells(mean, l_c, theta, rng): # theta kept as generic parameter name for this utility function
+def _sample_nb_counts(mean, l_c, theta, rng): # theta kept as generic parameter name for this utility function
     """
     Generate individual cell profiles from NB distribution
     Returns an array of shape (len(l_c), G)
@@ -58,7 +37,7 @@ def nb_cells(mean, l_c, theta, rng): # theta kept as generic parameter name for 
     # Assuming theta values are appropriate (positive).
 
     predicted_counts = rng.negative_binomial(theta_arr, p)
-    return predicted_counts
+    return sparse.csr_matrix(predicted_counts)
 
 
 def synthetic_DGP(
@@ -74,11 +53,11 @@ def synthetic_DGP(
     control_mu=None, # Control mu parameters, size of total number of genes in the real dataset (>= G)
     pert_mu=None, # Perturbed mu parameters, size of total number of genes in the real dataset (>= G)
     trial_id_for_rng=None, # Optional for seeding RNG per trial,
-    output_dir_for_chunks=None, # Directory to persist temporary chunked h5ad files
+    output_dir=None, # Directory to persist temporary chunked h5ad files
     max_cells_per_chunk=2048,
     normalize=True, # Whether to normalize before log1p for the persisted layer
     normalized_layer_key: str = "normalized_log1p", # Layer name for normalized/log1p values
-):
+) -> Tuple[list[str], list[np.ndarray]]:
     """
     Generate synthetic counts and persist them in chunked .h5ad files.
     Each chunk stores:
@@ -88,11 +67,11 @@ def synthetic_DGP(
       - chunk_paths: list[str], h5ad files containing sparse count chunks
       - all_affected_masks: list[np.ndarray], one mask per perturbation
     """
-    # Setup random number generator for this trial
-    if trial_id_for_rng is not None:
-        rng = np.random.RandomState(trial_id_for_rng)
-    else:
+    if trial_id_for_rng is None:
+        # TODO: change this to default_rng, check if downstream code is compatible with Generator instead of RandomState
         rng = np.random.RandomState(42)
+    else:
+        rng = np.random.RandomState(trial_id_for_rng)
     
     # --- Parameter Preparation with assertions ---
     # Assert that control_mu, pert_mu, and all_theta are provided
@@ -116,58 +95,53 @@ def synthetic_DGP(
     local_all_theta = all_theta[indices]  # Use the all-cells theta
     local_pert_mu = pert_mu[indices]
 
-    if output_dir_for_chunks is None:
-        raise ValueError("output_dir_for_chunks must be provided.")
+    var = pd.DataFrame(index=pd.Index([f"gene_{i}" for i in range(G)], name="gene"))
 
-    os.makedirs(output_dir_for_chunks, exist_ok=True)
-    max_cells_per_chunk = max(1, int(max_cells_per_chunk))
+    if output_dir is None:
+        raise ValueError("output_dir must be provided.")
+    os.makedirs(output_dir, exist_ok=True)
+
     all_affected_masks = []
     chunk_paths = []
-    chunk_id = 0
+    chunk_idx = 0
 
     # Buffer small batches so we write fewer, larger .h5ad chunks.
-    buffer_mats = []
+    buffer_X: list[sparse.csr_matrix] = []
     buffer_labels = []
-    buffered_rows = 0
+    buffer_rows = 0
 
     def flush_buffer():
-        nonlocal chunk_id, buffered_rows
-        if buffered_rows == 0:
+        nonlocal chunk_idx, buffer_rows
+        if buffer_rows == 0:
             return
         # Persist one sparse chunk to disk and clear in-memory buffers.
-        chunk_counts = np.vstack(buffer_mats).astype(np.int32, copy=False)
+        chunk_counts = sparse.vstack(buffer_X).astype(np.int32, copy=False)
         chunk_labels = np.concatenate(buffer_labels).astype(np.int32, copy=False)
-        chunk_counts_csr = sparse.csr_matrix(chunk_counts)
+        # chunk_counts_csr = sparse.csr_matrix(chunk_counts)
         obs = pd.DataFrame(
             {"perturbation": chunk_labels},
-            index=[f"cell_{chunk_id}_{i}" for i in range(chunk_counts.shape[0])],
+            index=[f"cell_{chunk_idx}_{i}" for i in range(chunk_counts.shape[0])],
         )
-        chunk_adata = ad.AnnData(
-            X=chunk_counts_csr,
-            obs=obs,
-        )
-        chunk_adata.layers[normalized_layer_key] = _normalize_and_log1p(
-            chunk_counts_csr,
-            normalize=normalize,
-        )
-        chunk_path = os.path.join(output_dir_for_chunks, f"synthetic_chunk_{chunk_id:06d}.h5ad")
+        chunk_adata = ad.AnnData(X=chunk_counts, obs=obs, var=var)
+        chunk_adata.layers[normalized_layer_key] = _normalize_and_log1p(chunk_counts, normalize=normalize)
+        chunk_path = os.path.join(output_dir, f"synthetic_chunk_{chunk_idx:06d}.h5ad")
         chunk_adata.write_h5ad(chunk_path, compression="gzip")
         chunk_paths.append(chunk_path)
 
-        buffer_mats.clear()
+        buffer_X.clear()
         buffer_labels.clear()
-        buffered_rows = 0
-        chunk_id += 1
+        buffer_rows = 0
+        chunk_idx += 1
 
     def append_counts(counts_block, perturbation_id):
-        nonlocal buffered_rows
+        nonlocal buffer_rows
         if counts_block.size == 0:
             return
         # perturbation_id == -1 is reserved for control cells.
-        buffer_mats.append(counts_block.astype(np.int32, copy=False))
+        buffer_X.append(counts_block.astype(np.int32, copy=False))
         buffer_labels.append(np.full(counts_block.shape[0], perturbation_id, dtype=np.int32))
-        buffered_rows += counts_block.shape[0]
-        if buffered_rows >= max_cells_per_chunk:
+        buffer_rows += counts_block.shape[0]
+        if buffer_rows >= max_cells_per_chunk:
             flush_buffer()
 
     # 1. Sample control cells with bias (B, dispersion set to all_theta from all cells, fixed dispersion assumption)
@@ -177,7 +151,7 @@ def synthetic_DGP(
         lib_size_control = rng.lognormal(
             mean=mu_l, sigma=0.1714, size=current_batch_size
         )  # 0.1714 from all cells of the Norman19 dataset
-        control_counts = nb_cells(
+        control_counts = _sample_nb_counts(
             mean=local_control_mu, l_c=lib_size_control, theta=local_all_theta, rng=rng
         )
         append_counts(control_counts, perturbation_id=-1)
@@ -198,17 +172,17 @@ def synthetic_DGP(
             effect_directions = rng.choice([effect_factor, 1.0/effect_factor], size=affected_mask_loop.sum())   # alpha in Eq 2 and 4
             mu_k_loop[affected_mask_loop] *= effect_directions
 
-        pert_cells_remaining = int(Nk)
-        while pert_cells_remaining > 0:
-            current_batch_size = min(max_cells_per_chunk, pert_cells_remaining)
+        remaining = int(Nk)
+        while remaining > 0:
+            current_batch_size = min(max_cells_per_chunk, remaining)
             lib_size_pert = rng.lognormal(
                 mean=mu_l, sigma=0.1714, size=current_batch_size
             )  # 0.1714 from all cells of the Norman19 dataset
-            pert_counts = nb_cells(
+            pert_counts = _sample_nb_counts(
                 mean=mu_k_loop, l_c=lib_size_pert, theta=local_all_theta, rng=rng
             )
             append_counts(pert_counts, perturbation_id=perturbation_id)
-            pert_cells_remaining -= current_batch_size
+            remaining -= current_batch_size
 
     flush_buffer()
     return chunk_paths, all_affected_masks
