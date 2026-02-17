@@ -1,23 +1,103 @@
-"""
-Model for perturbation analysis using scVI.
-
-This module provides tools for performing perturbation analysis on single-cell
-RNA-seq data using the scVI framework.
-"""
-
-from typing import Literal
+from typing import Optional, Literal
 
 import anndata
-import matplotlib.pyplot as plt
 import numpy as np
-import scanpy as sc
 import scvi
 import torch
-from scipy.sparse import csr_matrix
-from scipy.stats import pearsonr  # type: ignore
+from scvi.dataloaders import CollectionAdapter
 
 torch.set_float32_matmul_precision("medium")
-scvi.settings.seed = 42
+
+
+class ScviPerturbation:
+    """Train scVI on train data and infer on test data."""
+
+    def __init__(
+        self,
+        data: anndata.AnnData | anndata.experimental.AnnCollection,
+        counts_layer: Optional[str] = None,
+        perturbation_key: str = "perturbation",
+        cell_type_key: str = "cell_type",
+        batch_key: Optional[str] = None,
+        train_idx: Optional[np.ndarray] = None,
+        val_idx: Optional[np.ndarray] = None,
+        test_idx: Optional[np.ndarray] = None,
+        seed: int = 42,
+    ) -> None:
+        self.data = self._adapt_data(data)
+        self.counts_layer = counts_layer
+        self.perturbation_key = perturbation_key
+        self.cell_type_key = cell_type_key
+        self.batch_key = batch_key
+        self.seed = seed
+
+        self.model: Optional[scvi.model.SCVI] = None
+        self.train_idx = train_idx
+        self.val_idx = val_idx
+        self.test_idx = test_idx
+
+    @staticmethod
+    def _adapt_data(
+        data: anndata.AnnData | anndata.experimental.AnnCollection | CollectionAdapter,
+    ) -> anndata.AnnData | CollectionAdapter:
+        if isinstance(data, (anndata.AnnData, CollectionAdapter)):
+            return data
+        else:
+            return CollectionAdapter(data)
+
+    def run(
+        self,
+        n_latent: int = 10,
+        n_hidden: int = 128,
+        n_layers: int = 1,
+        gene_likelihood: str = "zinb",
+        dispersion: str = "gene",
+        max_epochs: int = 50,
+        batch_size: int = 256,
+        early_stopping: bool = False,
+    ) -> anndata.AnnData:
+        setup_kwargs: dict[str, object] = {
+            "categorical_covariate_keys": [self.perturbation_key],
+        }
+        if self.counts_layer is not None:
+            setup_kwargs["layer"] = self.counts_layer
+        if self.batch_key is not None:
+            setup_kwargs["batch_key"] = self.batch_key
+
+        scvi.model.SCVI.setup_anndata(self.data, **setup_kwargs)
+        self.model = scvi.model.SCVI(
+            self.data,
+            n_latent=n_latent,
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            gene_likelihood=gene_likelihood,
+            dispersion=dispersion,
+        )
+        self.model.train(
+            max_epochs=max_epochs,
+            batch_size=batch_size,
+            early_stopping=early_stopping,
+            datasplitter_kwargs={
+                "external_indexing": [self.train_idx, self.val_idx, self.test_idx],
+                "num_workers": 4,
+                "persistent_workers": True,  # need when num_workers > 0
+            },
+        )
+        
+        # store results in an annData object
+        z = self.model.get_latent_representation(indices=self.test_idx)
+        scvi_normalized = self.model.get_normalized_expression(indices=self.test_idx)
+        if isinstance(self.data, CollectionAdapter):
+            # IMPORTANT: AnnCollectionView.to_adata() gives X/layers; AnnCollection.to_adata() does not. :contentReference[oaicite:1]{index=1}
+            test_view = self.data.collection[self.test_idx, :]   # AnnCollectionView
+            adata_out = test_view.to_adata()
+        else:
+            # regular AnnData case
+            adata_out = self.data[self.test_idx].copy()
+        
+        adata_out.obsm["X_scvi"] = z
+        adata_out.layers["scvi_normalized"] = scvi_normalized.astype("float32", copy=False)
+        return adata_out
 
 
 class ScviPerturbationModel:
@@ -116,99 +196,3 @@ class ScviPerturbationModel:
         self.adata.layers["scvi_posterior_samples"] = median_posterior_samples
 
         return self.adata
-
-
-if __name__ == "__main__":
-    # create synthetic data
-    is_synthetic = False
-    adata = anndata.AnnData()
-    if is_synthetic:
-        np.random.seed(42)  # noqa
-        n_cells = 500
-        n_genes = 200
-        n_perturbations = 5
-
-        # Simulate count data
-        counts = np.random.negative_binomial(5, 0.3, size=(n_cells, n_genes))  # noqa
-        adata = anndata.AnnData(
-            X=csr_matrix(counts.astype(np.float32)),
-            obs={
-                "perturbation": np.random.choice(  # noqa
-                    [f"pert_{i}" for i in range(n_perturbations)] + ["control"],
-                    size=n_cells,
-                )
-            },
-        )
-        adata.layers["counts"] = adata.X.copy()  # type: ignore
-    else:
-        # Load Norman19 data
-        adata = sc.read_h5ad(
-            "data/norman19/norman19_processed.h5ad"
-        )
-        # print("Original Norman adata shape:", adata.shape)
-        # indices = np.random.choice(adata.n_obs, size=1000, replace=False)  # noqa
-        # adata = adata[indices].copy()
-
-    print("adata shape:", adata.shape)
-    print("adata obs", adata.obs.keys())
-    print("adata layers", adata.layers.keys())
-    print("adata obsm", adata.obsm.keys())
-    print("adata var", adata.var.keys())
-    print("Cell Types:", adata.obs["cell_type"].unique())
-    print(f"Perturbations: {adata.obs['perturbation'].nunique()}")
-    print(f"Perturbation counts:\n{adata.obs['perturbation'].value_counts().head(10)}")
-
-    # --- Train model ---
-    model = ScviPerturbationModel(adata)
-    model.run(
-        n_latent=10,
-        n_hidden=128,
-        n_layers=1,
-        gene_likelihood="zinb",
-        max_epochs=5,
-        batch_size=256,
-        early_stopping=False,
-    )
-    print(model.model.summary_string)  # type: ignore
-    print(model.model.history.keys())  # type: ignore
-    print(model.model.history["train_loss"].tail(10))  # type: ignore
-
-    # Check scales match
-    print("Counts range:", adata.layers["counts"].min(), adata.layers["counts"].max())
-    print(
-        "Posterior range:",
-        adata.layers["scvi_posterior_samples"].min(),
-        adata.layers["scvi_posterior_samples"].max(),
-    )
-    print("adata.X range:", adata.X.min(), adata.X.max())  # type: ignore # if much smaller, it's log-normalized
-    print(
-        "Normalized expression range:",
-        adata.layers["scvi_normalized"].min(),
-        adata.layers["scvi_normalized"].max(),
-    )
-    # Mean expression per gene
-    original = np.array(adata.layers["counts"].todense())  # type: ignore
-    reconstructed = adata.layers["scvi_posterior_samples"]
-    orig_mean = original.mean(axis=0)
-    recon_mean = reconstructed.mean(axis=0)
-
-    r, _ = pearsonr(
-        orig_mean.A1 if hasattr(orig_mean, "A1") else orig_mean,
-        recon_mean.A1 if hasattr(recon_mean, "A1") else recon_mean,
-    )
-    print(f"Pearson correlation between original and reconstructed mean expression: {r:.3f}")
-
-    plt.scatter(orig_mean, recon_mean, alpha=0.3, s=5)  # type: ignore
-    plt.xlabel("Original mean expression")  # type: ignore
-    plt.ylabel("Reconstructed mean expression")  # type: ignore
-    plt.title(f"Per-gene mean expression (Pearson r={r:.3f})")  # type: ignore
-    plt.plot([0, orig_mean.max()], [0, orig_mean.max()], "r--")  # type: ignore
-    # Diagonal line matching axis limits)
-    model_dir = "models/"
-    plt.savefig(model_dir + "SCVI_gene_correlation.png")  #  type: ignore
-    # plt.show()
-
-    print(f"Latent shape: {adata.obsm['Z_scvi'].shape}")
-    print(f"Normalized expression shape: {adata.layers['scvi_normalized'].shape}")
-    print(f"Posterior samples shape: {adata.layers['scvi_posterior_samples'].shape}")
-    print("Done!")

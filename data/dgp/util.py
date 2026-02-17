@@ -92,6 +92,7 @@ class ChunkedAnnDataWriter:
             index=[f"cell_{self._chunk_idx}_{i}" for i in range(chunk_counts.shape[0])],
         )
         chunk_adata = ad.AnnData(X=chunk_counts, obs=obs, var=self.var)
+        chunk_adata.layers["counts"] = chunk_counts.copy()
         chunk_adata.layers[self.normalized_layer_key] = _normalize_and_log1p(
             chunk_counts, normalize=self.normalize
         )

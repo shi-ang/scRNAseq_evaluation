@@ -18,6 +18,7 @@ from metrics.perturbation_effect.perturbation_discrimination_score import comput
 from metrics.perturbation_effect.r_square import r2_score_pert
 from metrics.reconstruction.mean_error import mean_error_pert
 from data.dgp import synthetic_DGP, synthetic_causalDGP
+from models.scvi_pert import ScviPerturbation
 
 # Set OpenBLAS threads early if it was found to be helpful, otherwise optional
 # os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -33,13 +34,14 @@ _PARAM_RANGES = {
     'B': {'type': 'float', 'min': 0.0, 'max': 2.0}, # 0.0, 2.0, beta
     'mu_l': {'type': 'log_float', 'min': 0.2, 'max': 5.0} # 0.2, 5.0, mu_l
 }
-_MODELS = ["Control", "Average"]
+# _MODELS = ["Control", "Average", "scVI"]
+_MODELS = ["scVI"]
 _NORM_LAYER_KEY = "normalized_log1p"
 
 
 def evaluation(
-        x_pred,
-        x_obs,
+        pred,
+        obs,
         mu_pred,
         mu_obs,
         mu_control_obs,
@@ -50,8 +52,8 @@ def evaluation(
     """
     Perform evaluation of the predicted single-cell profiles.
     
-    :param x_pred: predicted single-cell profiles matrix, shape (n_cells, n_genes)
-    :param x_obs: observed single-cell profiles matrix, shape (n_cells, n_genes)
+    :param pred: predicted single-cell profiles matrix, shape (n_cells, n_genes)
+    :param obs: observed single-cell profiles matrix, shape (n_cells, n_genes)
     :param mu_pred: predicted mean expression matrix, shape (n_perturbations, n_genes)
     :param mu_obs: observed mean expression matrix, shape (n_perturbations, n_genes)
     :param mu_control_obs: observed mean expression matrix for control, shape (n_genes)
@@ -59,8 +61,25 @@ def evaluation(
     :param DEGs_stats: list of differentially expressed genes masks for each perturbation, from statistical testing
     :param model: The prediction model used, affects certain calculations
     """
-    n_genes = mu_obs.shape[1]
     n_perts = mu_obs.shape[0]
+    if mu_pred is None:
+        if pred is None:
+            raise ValueError("pred must be provided when mu_pred is None.")
+        if "perturbation" not in pred.obs.columns:
+            raise KeyError("pred.obs must contain 'perturbation' when mu_pred is None.")
+
+        if model == "scVI":
+            layer_key = "scvi_normalized"
+        else:
+            raise NotImplementedError(f"Model '{model}' is not implemented for on-the-fly pseudobulk calculation when mu_pred is None.")
+        # get pseudobulk for predicted profiles
+        mu_pred = np.empty((n_perts, pred.shape[1]), dtype=np.float32)
+        for p_idx in range(n_perts):
+            pert_mask = pred.obs["perturbation"] == p_idx
+            if pert_mask.sum() == 0:
+                raise ValueError(f"No cells found for perturbation index {p_idx} in pred.")
+            mu_pred[p_idx, :] = pred.layers[layer_key][pert_mask, :].mean(axis=0)
+        
     # PDS(Perturbation Discrimination Score) calculation
     # PDS-l1 and PDS-l2 are independent of reference, because reference will be cancelled out
     # TODO: check if the scores are the same 
@@ -100,8 +119,8 @@ def evaluation(
     for ptb_idx in range(n_perts):
         DEGs_stats_ptb = DEGs_stats[ptb_idx]
         
-        mu_obs_ptb = mu_obs[ptb_idx].astype(np.float32)
-        mu_pred_ptb = mu_pred[ptb_idx].astype(np.float32)
+        mu_obs_ptb = mu_obs[ptb_idx].astype(np.float32, copy=False)
+        mu_pred_ptb = mu_pred[ptb_idx].astype(np.float32, copy=False)
         if model != "Control":
             results_tracker['pearson_all'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs))
             results_tracker['pearson_degs'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, DEGs=DEGs_stats_ptb))
@@ -227,6 +246,7 @@ def simulate_one_run(
             collection = AnnCollection(
                 backed_chunks,
                 join_vars="inner",
+                join_obsm='inner',
                 label="chunk_id",
                 keys=[str(i) for i in range(len(backed_chunks))],
                 index_unique="-",
@@ -317,20 +337,20 @@ def simulate_one_run(
         }
 
         # Split indices 
-        train_idx, _, test_idx = stratified_split_ac(
+        train_idx, val_idx, test_idx = stratified_split_ac(
             ac=collection,
             obs_key="perturbation",
             train_frac=0.8,
-            val_frac=0.0,
+            val_frac=0.1,
             test_frac=0.2,
             seed=trial_id_for_rng,
             shuffle_within_split=True,
         )
-        ac_train = collection[train_idx]
+        ac_train_val = collection[np.concatenate([train_idx, val_idx])]
         ac_test = collection[test_idx]
 
         mu_control_train, mu_pool_train, _ = get_pseudobulks_and_degs(
-            ac_view=ac_train,
+            ac_view=ac_train_val,
             ac_batch_size=ann_batch_size,
             return_degs=False,
             layer_key=_NORM_LAYER_KEY,
@@ -348,18 +368,38 @@ def simulate_one_run(
         all_results = []
         for model in _MODELS:
             start_time = time.time()
+            mu_pred = None
+            ad_test = None
             if model == "Control":
-                x_pred = None
                 mu_pred = np.tile(mu_control_train, (P, 1))
             elif model == "Average":
-                x_pred = None
                 mu_pred = np.tile(mu_pool_train, (P, 1))
+            elif model == "scVI":
+                scvi_model = ScviPerturbation(
+                    data=collection,
+                    counts_layer="counts",
+                    perturbation_key="perturbation", # NOTE: check if this is useful
+                    train_idx=train_idx,
+                    val_idx=val_idx,
+                    test_idx=test_idx,
+                    seed=trial_id_for_rng if trial_id_for_rng is not None else 42,
+                )
+                ad_test = scvi_model.run(
+                    n_latent=10,
+                    n_hidden=128,
+                    n_layers=3,
+                    gene_likelihood="zinb",
+                    dispersion="gene",
+                    max_epochs=100,
+                    batch_size=512,
+                    early_stopping=True,
+                )
             else:
                 raise NotImplementedError(f"Model '{model}' is not implemented.")
 
             model_results = evaluation(
-                x_pred=x_pred,
-                x_obs=None, # TODO: change to ac_test.X later
+                pred=ad_test,
+                obs=ac_test,
                 mu_obs=mu_obs,
                 mu_pred=mu_pred,
                 mu_control_obs=mu_control_test,
@@ -572,7 +612,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--max_cells_per_chunk", type=int, default=2048, help="Maximum cells per generated h5ad chunk")
     parser.add_argument("--ann_batch_size", type=int, default=1024, help="Batch size when iterating AnnCollection")
-    parser.add_argument("--dataset", type=str, default="synthetic_two", choices=["synthetic_one", "synthetic_two"], help="Dataset to use for the simulation")
+    parser.add_argument("--dataset", type=str, default="synthetic_one", choices=["synthetic_one", "synthetic_two"], help="Dataset to use for the simulation")
     args = parser.parse_args()
 
     # Set seed
