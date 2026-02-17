@@ -5,7 +5,9 @@ def pearson_pert(
         X_obs: np.ndarray, 
         X_pred: np.ndarray, 
         reference: np.ndarray, 
-        DEGs: np.ndarray = None
+        DEGs: np.ndarray = None,
+        log_fold: bool = False,
+        eps: float = 1e-6
     ) -> float:
     """
     Compute Pearson using a specific reference, for one perturbation.
@@ -15,11 +17,16 @@ def pearson_pert(
     * X_pred: predicted post-perturbation profile. Shape: (n_genes,)
     * reference: reference. Shape: (n_genes,)
     * DEGs: indicators of differentially expressed genes. Shape: (n_genes,)
-
+    * log_fold: whether to log fold change
+    * eps: small constant to avoid log of zero
     Returns a dictionary with 2 metrics: corr_all_allpert (PearsonΔ) and corr_20de_allpert (PearsonΔ20)
     """
-    delta_obs = X_obs - reference
-    delta_pred = X_pred - reference
+    if log_fold:
+        delta_obs = np.log2(X_obs + eps) - np.log2(reference + eps)
+        delta_pred = np.log2(X_pred + eps) - np.log2(reference + eps)
+    else:
+        delta_obs = X_obs - reference
+        delta_pred = X_pred - reference
 
     if DEGs is not None:
         if DEGs.sum() >= 2:

@@ -1,10 +1,13 @@
 from sklearn.metrics import pairwise_distances
 import numpy as np
 
-def compute_pds(
-    true_effects: np.ndarray,
-    pred_effects: np.ndarray,
+def pds(
+    X_obs: np.ndarray,
+    X_pred: np.ndarray,
+    reference: np.ndarray,
     metric: str = "l1",
+    log_fold: bool = False,
+    eps: float = 1e-6
 ) -> float:
     """
     Compute discrimination score for each perturbation.
@@ -15,6 +18,14 @@ def compute_pds(
       - "cosine": sklearn cosine distance
       - "sign": 1 - (proportion of sign matches), computed over genes with nonzero true effect
     """
+    if log_fold:
+        X_obs = np.log2(X_obs + eps) 
+        X_pred = np.log2(X_pred + eps) - reference
+        reference = np.log2(reference + eps)
+    
+    true_effects = X_obs - reference
+    pred_effects = X_pred - reference
+
     n_perts = true_effects.shape[0]
     scores = np.empty(n_perts)
 

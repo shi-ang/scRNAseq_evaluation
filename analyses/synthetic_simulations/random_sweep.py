@@ -14,7 +14,7 @@ from anndata.experimental import AnnCollection
 
 from .util import est_cost, systematic_variation, intra_correlation, sum_and_sumsq, stratified_split_ac, get_pseudobulks_and_degs, vendi_score
 from metrics.perturbation_effect.pearson import pearson_pert
-from metrics.perturbation_effect.perturbation_discrimination_score import compute_pds
+from metrics.perturbation_effect.perturbation_discrimination_score import pds
 from metrics.perturbation_effect.r_square import r2_score_pert
 from metrics.reconstruction.mean_error import mean_error_pert
 from data.dgp import synthetic_DGP, synthetic_causalDGP
@@ -83,23 +83,26 @@ def evaluation(
     # PDS(Perturbation Discrimination Score) calculation
     # PDS-l1 and PDS-l2 are independent of reference, because reference will be cancelled out
     # TODO: check if the scores are the same 
-    pds_l1_score = compute_pds(
-        true_effects=mu_obs, # equally, mu_obs - hat_mu0
-        pred_effects=mu_pred, # equally, mu_pred - hat_mu0
+    pds_l1_score = pds(
+        X_obs=mu_obs,
+        X_pred=mu_pred,
+        reference=mu_control_obs, # can be any reference, because it will be cancelled out in l1/l2
         metric="l1",
     )
 
-    pds_l2_score = compute_pds(
-        true_effects=mu_obs,
-        pred_effects=mu_pred,
+    pds_l2_score = pds(
+        X_obs=mu_obs,
+        X_pred=mu_pred,
+        reference=mu_control_obs, # can be any reference, because it will be cancelled out in l1/l2
         metric="l2",
     )
 
     # PSD-cosine uses reference, so we use mu_control as reference
     # TODO: this should not be the same, check it
-    pds_cosine_score = compute_pds(
-        true_effects=mu_obs - mu_control_obs,
-        pred_effects=mu_pred - mu_control_obs,
+    pds_cosine_score = pds(
+        X_obs=mu_obs,
+        X_pred=mu_pred,
+        reference=mu_control_obs,
         metric="cosine",
     )
     
@@ -369,7 +372,7 @@ def simulate_one_run(
         for model in _MODELS:
             start_time = time.time()
             mu_pred = None
-            ad_test = None
+            ad_test_pred = None
             if model == "Control":
                 mu_pred = np.tile(mu_control_train, (P, 1))
             elif model == "Average":
@@ -384,7 +387,7 @@ def simulate_one_run(
                     test_idx=test_idx,
                     seed=trial_id_for_rng if trial_id_for_rng is not None else 42,
                 )
-                ad_test = scvi_model.run(
+                ad_test_pred = scvi_model.run(
                     n_latent=10,
                     n_hidden=128,
                     n_layers=3,
@@ -398,7 +401,7 @@ def simulate_one_run(
                 raise NotImplementedError(f"Model '{model}' is not implemented.")
 
             model_results = evaluation(
-                pred=ad_test,
+                pred=ad_test_pred,
                 obs=ac_test,
                 mu_obs=mu_obs,
                 mu_pred=mu_pred,
