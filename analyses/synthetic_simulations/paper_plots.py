@@ -197,7 +197,7 @@ def plot_pds_vs_parameter(data, save_path, x_column, title, x_label,
     )
 
 def plot_pearson_delta_vs_parameter(data, save_path, x_column, title, x_label,
-                                    window=50, y_column='pearson_all_median',
+                                    window=50, y_column='pearson',
                                     y_label=r'Median Pearson$(\Delta^{pred},\Delta^{obs})$',
                                     log_x=False, log_x_if_range=False, corr_log_x=None):
     """Plot Pearson delta vs a parameter with a moving average trend line."""
@@ -330,7 +330,7 @@ def main():
             data=data,
             save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_perturbations.pdf'),
             x_column='P',
-            y_column='pearson_degs_median',
+            y_column='pearson_degs',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{k}$ $\mathbf{(Simulation)}$',
             x_label='Number of Perturbations ($k$)',
             y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
@@ -485,11 +485,48 @@ def main():
             data=data,
             save_path=os.path.join(plot_dir, 'mse_vs_p_effect.pdf'),
             x_column='p_effect',
-            y_column='mse_all_median',
+            y_column='mse',
             title=r'$\mathbf{MSE}$ $\mathbf{(Simulation)}$',
             x_label=r'Perturbation Probability ($\delta$)',
             y_label='MSE',
             window=window,
+        )
+
+        # plot systematic variation vs intra-data correlation
+        plot_metric_vs_parameter(
+            data=data,
+            save_path=os.path.join(plot_dir, 'systematic_variation_vs_intra_corr.pdf'),
+            x_column='systematic_variation',
+            y_column='intra_corr',
+            title=r'$\mathbf{Intra}$-$\mathbf{data}$ $\mathbf{Correlation}$ $\mathbf{by}$ $\mathbf{Systematic}$ $\mathbf{Variation}$  $\mathbf{(Simulation)}$',
+            x_label='Systematic Variation',
+            y_label='Intra-data Correlation',
+            window=window,
+        )
+
+        # plot systematic variation vs vendi score
+        plot_metric_vs_parameter(
+            data=data,
+            save_path=os.path.join(plot_dir, 'systematic_variation_vs_vendi_score.pdf'),
+            x_column='systematic_variation',
+            y_column='vendi_score',
+            title=r'$\mathbf{Vendi}$ $\mathbf{Score}$ $\mathbf{by}$ $\mathbf{Systematic}$ $\mathbf{Variation}$  $\mathbf{(Simulation)}$',
+            x_label='Systematic Variation',
+            y_label='Vendi Score',
+            window=window,
+        )
+
+        # plot vendi score vs P
+        plot_metric_vs_parameter(
+            data=data,
+            save_path=os.path.join(plot_dir, 'vendi_score_vs_perturbations.pdf'),
+            x_column='P',
+            y_column='vendi_score',
+            title=r'$\mathbf{Vendi}$ $\mathbf{Score}$ $\mathbf{by}$ $\mathbf{k}$  $\mathbf{(Simulation)}$',
+            x_label='Number of Perturbations ($k$)',
+            y_label='Vendi Score',
+            window=window,
+            log_x_if_range=False,
         )
 
         print(f"Successfully generated all plots from {args.results}")

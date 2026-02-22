@@ -12,11 +12,13 @@ from scipy import sparse
 import anndata as ad
 from anndata.experimental import AnnCollection
 
-from .util import est_cost, systematic_variation, intra_correlation, sum_and_sumsq, stratified_split_ac, get_pseudobulks_and_degs, vendi_score
+from .util import est_cost, systematic_variation, intra_correlation, sum_and_sumsq, stratified_split_ac, get_pseudobulks_and_degs
 from metrics.perturbation_effect.pearson import pearson_pert
 from metrics.perturbation_effect.perturbation_discrimination_score import pds
 from metrics.perturbation_effect.r_square import r2_score_pert
+from metrics.reconstruction.vendi_score import vendi_score
 from metrics.reconstruction.mean_error import mean_error_pert
+from metrics.reconstruction.distribution_distance import distribution_distance
 from data.dgp import synthetic_DGP, synthetic_causalDGP
 from models.scvi_pert import ScviPerturbation
 
@@ -25,17 +27,17 @@ from models.scvi_pert import ScviPerturbation
 
 _GLOBAL = {}
 _PARAM_RANGES = {
-    'G': {'type': 'int', 'min': 1000, 'max': 8192}, # 1000, 8192, g
-    'N0': {'type': 'log_int', 'min': 10, 'max': 8192}, # 10, 8192, n_0
-    'Nk': {'type': 'log_int', 'min': 10, 'max': 256}, # 10, 256, n_p
-    'P': {'type': 'log_int', 'min': 10, 'max': 2000}, # 10, 2000, k
+    'G': {'type': 'log2_seq', 'min': 1024, 'max': 8192}, # 1000, 8192, g
+    'N0': {'type': 'log2_seq', 'min': 128, 'max': 1024}, # 10, 1024, n_0
+    'Nk': {'type': 'log2_seq', 'min': 128, 'max': 512}, # 128, 256, n_p
+    'P': {'type': 'int', 'min': 10, 'max': 100}, # 10, 100, k
     'p_effect': {'type': 'float', 'min': 0.001, 'max': 0.1}, # 0.001, 0.1, delta
     'effect_factor': {'type': 'float', 'min': 1.2, 'max': 5.0}, # 1.2, 5.0, epsilon
     'B': {'type': 'float', 'min': 0.0, 'max': 2.0}, # 0.0, 2.0, beta
-    'mu_l': {'type': 'log_float', 'min': 0.2, 'max': 5.0} # 0.2, 5.0, mu_l
+    'mu_l': {'type': 'float', 'min': 0.2, 'max': 5.0} # 0.2, 5.0, mu_l
 }
-# _MODELS = ["Control", "Average", "scVI"]
-_MODELS = ["scVI"]
+_MODELS = ["Control", "Average", "scVI"]
+# _MODELS = ["scVI"]
 _NORM_LAYER_KEY = "normalized_log1p"
 
 
@@ -80,6 +82,43 @@ def evaluation(
                 raise ValueError(f"No cells found for perturbation index {p_idx} in pred.")
             mu_pred[p_idx, :] = pred.layers[layer_key][pert_mask, :].mean(axis=0)
         
+    
+    if pred is not None and obs is not None:
+        parametric_distance = distribution_distance(
+            obs=obs,
+            pred=pred,
+            layer_obs=_NORM_LAYER_KEY,
+            layer_pred=layer_key,
+            control_label=-1,
+            method="parametric",
+            distribution_form="NB",
+            dist_type="JS-divergence",
+            use_pca=False,
+        )
+
+        mmd_distance = distribution_distance(
+            obs=obs,
+            pred=pred,
+            layer_obs=_NORM_LAYER_KEY,
+            layer_pred=layer_key,
+            control_label=-1,
+            method="mmd",
+            distribution_form="NB",
+            use_pca=True,
+        )
+
+        # measure vendi score for the predicted profiles
+        vendi_score_pred = vendi_score(
+            ac=pred,
+            n_pca_components=30,
+            layer_key=layer_key,
+        )
+
+    else:
+        parametric_distance = np.nan
+        mmd_distance = np.nan
+        vendi_score_pred = np.nan
+
     # PDS(Perturbation Discrimination Score) calculation
     # PDS-l1 and PDS-l2 are independent of reference, because reference will be cancelled out
     # TODO: check if the scores are the same 
@@ -107,17 +146,17 @@ def evaluation(
     )
     
     results_tracker = {
-        'pearson_all': [],
+        'pearson': [],
         'pearson_degs': [],
-        'mae_all': [],
+        'mae': [],
         'mae_degs': [],
-        'mse_all': [],
+        'mse': [],
         'mse_degs': [],
-        'r2_all': [],
+        'r2': [],
         'r2_degs': [],
     }
     # Calculate metrics per perturbation
-    # "_all" is for all genes
+    # without postfix is for all genes
     # "_degs" is for the genes identified as DEGs by the t-test (statistical DEGs)
     for ptb_idx in range(n_perts):
         DEGs_stats_ptb = DEGs_stats[ptb_idx]
@@ -125,29 +164,32 @@ def evaluation(
         mu_obs_ptb = mu_obs[ptb_idx].astype(np.float32, copy=False)
         mu_pred_ptb = mu_pred[ptb_idx].astype(np.float32, copy=False)
         if model != "Control":
-            results_tracker['pearson_all'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs))
+            results_tracker['pearson'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs))
             results_tracker['pearson_degs'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, DEGs=DEGs_stats_ptb))
 
-        results_tracker['mae_all'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute"))
-        results_tracker['mse_all'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared"))
+        results_tracker['mae'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute"))
+        results_tracker['mse'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared"))
         results_tracker['mae_degs'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute", weights=DEGs_stats_ptb.astype(np.float32)))
         results_tracker['mse_degs'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared", weights=DEGs_stats_ptb.astype(np.float32)))
 
-        results_tracker['r2_all'].append(r2_score_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs))
+        results_tracker['r2'].append(r2_score_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs))
         results_tracker['r2_degs'].append(r2_score_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, weights=DEGs_stats_ptb.astype(np.float32)))
 
     results_final = {
-        'pearson_all_median': np.nanmedian(results_tracker['pearson_all']) if results_tracker['pearson_all'] else np.nan,
-        'pearson_degs_median': np.nanmedian(results_tracker['pearson_degs']) if results_tracker['pearson_degs'] else np.nan,
-        'mae_all_median': np.nanmedian(results_tracker['mae_all']) if results_tracker['mae_all'] else np.nan,
-        'mae_degs_median': np.nanmedian(results_tracker['mae_degs']) if results_tracker['mae_degs'] else np.nan,
-        'mse_all_median': np.nanmedian(results_tracker['mse_all']) if results_tracker['mse_all'] else np.nan,
-        'mse_degs_median': np.nanmedian(results_tracker['mse_degs']) if results_tracker['mse_degs'] else np.nan,
+        'pearson': np.nanmedian(results_tracker['pearson']) if results_tracker['pearson'] else np.nan,
+        'pearson_degs': np.nanmedian(results_tracker['pearson_degs']) if results_tracker['pearson_degs'] else np.nan,
+        'mae': np.nanmedian(results_tracker['mae']) if results_tracker['mae'] else np.nan,
+        'mae_degs': np.nanmedian(results_tracker['mae_degs']) if results_tracker['mae_degs'] else np.nan,
+        'mse': np.nanmedian(results_tracker['mse']) if results_tracker['mse'] else np.nan,
+        'mse_degs': np.nanmedian(results_tracker['mse_degs']) if results_tracker['mse_degs'] else np.nan,
+        'r2': np.nanmedian(results_tracker['r2']) if results_tracker['r2'] else np.nan,
+        'r2_degs': np.nanmedian(results_tracker['r2_degs']) if results_tracker['r2_degs'] else np.nan,
+        'parametric_distance': parametric_distance,
+        'mmd_distance': mmd_distance,
+        'vendi_score': vendi_score_pred,
         'pds_l1': pds_l1_score,
         'pds_l2': pds_l2_score,
         'pds_cosine': pds_cosine_score,
-        'r2_all_median': np.nanmedian(results_tracker['r2_all']) if results_tracker['r2_all'] else np.nan,
-        'r2_degs_median': np.nanmedian(results_tracker['r2_degs']) if results_tracker['r2_degs'] else np.nan,
     }
     return results_final
 
@@ -203,6 +245,8 @@ def simulate_one_run(
                 N0=N0,
                 Nk=Nk,
                 P=P,
+                mu_l=mu_l,
+                all_theta=all_theta,
                 mask_method='Erdos-Renyi',
                 trial_id_for_rng=trial_id_for_rng,
                 output_dir=tmp_dir,
@@ -396,6 +440,7 @@ def simulate_one_run(
                     max_epochs=100,
                     batch_size=512,
                     early_stopping=True,
+                    dataloader_num_workers=0,
                 )
             else:
                 raise NotImplementedError(f"Model '{model}' is not implemented.")
@@ -427,15 +472,11 @@ def sample_parameters(param_ranges): # Unchanged from original
             params[param] = np.random.randint(range_info['min'], range_info['max'] + 1)
         elif range_info['type'] == 'float':
             params[param] = np.random.uniform(range_info['min'], range_info['max'])
-        elif range_info['type'] == 'log_float':
-            log_min = np.log10(range_info['min'])
-            log_max = np.log10(range_info['max'])
-            params[param] = 10 ** np.random.uniform(log_min, log_max)
-        elif range_info['type'] == 'log_int':
-            log_min = np.log10(range_info['min'])
-            log_max = np.log10(range_info['max'])
-            log_value = np.random.uniform(log_min, log_max)
-            params[param] = int(round(10 ** log_value))
+        elif range_info['type'] == 'log2_seq':
+            log_min = int(np.log2(range_info['min']))
+            log_max = int(np.log2(range_info['max']))
+            log_value = int(np.random.uniform(log_min, log_max + 1))
+            params[param] = 2 ** log_value
         elif range_info['type'] == 'fixed':
             params[param] = range_info['value']
     return params
@@ -482,10 +523,11 @@ def _pool_worker_timed(task_info_dict):
     except Exception as e:
         # Define metrics_error_keys locally for safety
         metrics_error_keys_local = { 
-            'pearson_all_median', 'pearson_degs_median',
-            'mae_all_median', 'mae_degs_median',
-            'mse_all_median', 'mse_degs_median',
-            'r2_all_median', 'r2_degs_median',
+            'pearson', 'pearson_degs',
+            'mae', 'mae_degs',
+            'mse', 'mse_degs',
+            'r2', 'r2_degs',
+            'parametric_distance', 'mmd_distance', 'vendi_score',
             'pds_l1', 'pds_l2', 'pds_cosine',
             'model', 'execution_time',
             'sparsity', 'median_library_size', 'systematic_variation', 'intra_corr', 'vendi_score',
@@ -566,7 +608,7 @@ def run_random_sweep(
 
     results_df = pd.DataFrame(all_results_data)
     
-    success_count = results_df[(results_df['status'] == 'success') & (results_df["model"] == "Average")].shape[0] if 'status' in results_df else 0
+    success_count = results_df[(results_df['status'] == 'success') & (results_df["model"] == _MODELS[0])].shape[0] if 'status' in results_df else 0
     failure_count = n_trials - success_count
 
     if failure_count > 0 and 'status' in results_df: # Ensure 'status' column exists
@@ -574,10 +616,11 @@ def run_random_sweep(
         failed_trials = results_df[results_df['status'] == 'failed']
         # Define metrics_error keys for excluding them from params logging
         metrics_error_keys = { 
-            'pearson_all_median', 'pearson_degs_median',
-            'mae_all_median', 'mae_degs_median',
-            'mse_all_median', 'mse_degs_median',
-            'r2_all_median', 'r2_degs_median',
+            'pearson', 'pearson_degs',
+            'mae', 'mae_degs',
+            'mse', 'mse_degs',
+            'r2', 'r2_degs',
+            'parametric_distance', 'mmd_distance', 'vendi_score',
             'pds_l1', 'pds_l2', 'pds_cosine',
             'sparsity', 'vendi_score'
         }
@@ -609,13 +652,13 @@ def run_random_sweep(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run random sweep simulations.")
     parser.add_argument("--output_dir", type=str, default="results/synthetic_simulations/random_sweep_results", help="Directory to save sweep results")
-    parser.add_argument("--n_trials", type=int, default=2, help="Number of trials to run")
-    parser.add_argument("--num_workers", type=int, default=32, help="Number of worker processes for multiprocessing")
+    parser.add_argument("--n_trials", type=int, default=5, help="Number of trials to run")
+    parser.add_argument("--num_workers", type=int, default=2, help="Number of worker processes for multiprocessing")
     parser.add_argument("--multiprocessing", action="store_true", help="Enable multiprocessing")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--max_cells_per_chunk", type=int, default=2048, help="Maximum cells per generated h5ad chunk")
     parser.add_argument("--ann_batch_size", type=int, default=1024, help="Batch size when iterating AnnCollection")
-    parser.add_argument("--dataset", type=str, default="synthetic_one", choices=["synthetic_one", "synthetic_two"], help="Dataset to use for the simulation")
+    parser.add_argument("--dataset", type=str, default="synthetic_two", choices=["synthetic_one", "synthetic_two"], help="Dataset to use for the simulation")
     args = parser.parse_args()
 
     # Set seed
@@ -629,13 +672,13 @@ if __name__ == "__main__":
     print("Using theta estimates from all cells combined")
     
     # Extract parameters for simulation
-    main_control_mu_loaded = control_params_df['mu'].values
-    main_pert_mu_loaded = perturbed_params_df['mu'].values
+    control_mu = control_params_df['mu'].values
+    pert_mu = perturbed_params_df['mu'].values
     
     # Use theta (n) from all cells estimation
-    main_all_theta_loaded = all_params_df['n'].values
+    all_theta = all_params_df['n'].values
     
-    print(f"Using {len(main_control_mu_loaded)} genes for simulation.")
+    print(f"Using {len(control_mu)} genes for simulation.")
     
     # Call the final version of run_random_sweep
     print("Running the sweep...")
@@ -643,9 +686,9 @@ if __name__ == "__main__":
         args.dataset,
         args.n_trials, 
         args.output_dir, 
-        control_mu=main_control_mu_loaded, 
-        all_theta=main_all_theta_loaded,
-        pert_mu=main_pert_mu_loaded,
+        control_mu=control_mu, 
+        all_theta=all_theta,
+        pert_mu=pert_mu,
         num_workers=args.num_workers, # num_worker should be around 0.6 * RAM / MAX_SPACE_PER_WORK
         use_multiprocessing=args.multiprocessing,
         max_cells_per_chunk=args.max_cells_per_chunk,

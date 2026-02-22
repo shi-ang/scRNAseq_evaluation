@@ -55,6 +55,8 @@ class ScviPerturbation:
         max_epochs: int = 50,
         batch_size: int = 256,
         early_stopping: bool = False,
+        dataloader_num_workers: int = 0,
+        dataloader_persistent_workers: Optional[bool] = None,
     ) -> anndata.AnnData:
         setup_kwargs: dict[str, object] = {
             "categorical_covariate_keys": [self.perturbation_key],
@@ -73,15 +75,25 @@ class ScviPerturbation:
             gene_likelihood=gene_likelihood,
             dispersion=dispersion,
         )
+        if dataloader_num_workers < 0:
+            raise ValueError("dataloader_num_workers must be >= 0.")
+        if dataloader_persistent_workers is None:
+            dataloader_persistent_workers = dataloader_num_workers > 0
+
+        datasplitter_kwargs: dict[str, object] = {
+            "external_indexing": [self.train_idx, self.val_idx, self.test_idx],
+            # Keep this at 0 by default to avoid nested multiprocessing semaphore
+            # issues when the outer sweep already runs in many worker processes.
+            "num_workers": int(dataloader_num_workers),
+        }
+        if dataloader_num_workers > 0:
+            datasplitter_kwargs["persistent_workers"] = bool(dataloader_persistent_workers)
+
         self.model.train(
             max_epochs=max_epochs,
             batch_size=batch_size,
             early_stopping=early_stopping,
-            datasplitter_kwargs={
-                "external_indexing": [self.train_idx, self.val_idx, self.test_idx],
-                "num_workers": 4,
-                "persistent_workers": True,  # need when num_workers > 0
-            },
+            datasplitter_kwargs=datasplitter_kwargs,
         )
         
         # store results in an annData object

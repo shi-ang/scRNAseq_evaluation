@@ -3,39 +3,7 @@ import numpy as np
 from scipy import sparse
 import pandas as pd
 
-from .util import ChunkedAnnDataWriter
-
-
-def _sample_nb_counts(mean, l_c, theta, rng): # theta kept as generic parameter name for this utility function
-    """
-    Generate individual cell profiles from NB distribution
-    Returns an array of shape (len(l_c), G)
-    """
-    # Ensure mean and theta are numpy arrays for element-wise operations
-    mean_arr = np.asarray(mean) # size of genes
-    theta_arr = np.asarray(theta) # size of genes
-    l_c_arr = np.asarray(l_c) # size of cells
-
-    # Correct mean for library size
-    lib_size_corrected_mean = np.outer(l_c_arr, mean_arr)
-
-    # Prevent division by zero or negative p if theta + mean is zero or mean is much larger than theta
-    # This can happen if means are very low and theta is also low.
-    # Add a small epsilon to the denominator to stabilize.
-    # Also ensure p is within (0, 1)
-    p_denominator = theta_arr + lib_size_corrected_mean
-    p_denominator[p_denominator <= 0] = 1e-9 # Avoid zero or negative denominator
-    
-    p = theta_arr / p_denominator
-    p = np.clip(p, 1e-9, 1 - 1e-9) # Ensure p is in a valid range for negative_binomial
-
-    # Negative binomial expects n (number of successes, our theta) to be > 0.
-    # And p (probability of success) to be in [0, 1].
-    # If theta contains zeros or negatives, np.random.negative_binomial will fail.
-    # Assuming theta values are appropriate (positive).
-
-    predicted_counts = rng.negative_binomial(theta_arr, p)
-    return sparse.csr_matrix(predicted_counts)
+from .util import ChunkedAnnDataWriter, sample_nb_counts
 
 
 def synthetic_DGP(
@@ -86,7 +54,7 @@ def synthetic_DGP(
     assert len(control_mu) >= G, f"G parameter ({G}) cannot be larger than the length of provided arrays ({len(control_mu)})"
     # --- End of assertions ---
     
-    # Sample G elements from control_mu and all_theta
+    # Sample G elements from control_mu, all_theta, and pert_mu to define the local parameters for selected genes
     indices = rng.choice(len(control_mu), size=G, replace=False)
     local_control_mu = control_mu[indices]
     local_all_theta = all_theta[indices]  # Use the all-cells theta
@@ -113,7 +81,7 @@ def synthetic_DGP(
         lib_size_control = rng.lognormal(
             mean=mu_l, sigma=0.1714, size=current_batch_size
         )  # 0.1714 from all cells of the Norman19 dataset
-        control_counts = _sample_nb_counts(
+        control_counts = sample_nb_counts(
             mean=local_control_mu, l_c=lib_size_control, theta=local_all_theta, rng=rng
         )
         writer.append_counts(control_counts, perturbation_id=-1)
@@ -140,7 +108,7 @@ def synthetic_DGP(
             lib_size_pert = rng.lognormal(
                 mean=mu_l, sigma=0.1714, size=current_batch_size
             )  # 0.1714 from all cells of the Norman19 dataset
-            pert_counts = _sample_nb_counts(
+            pert_counts = sample_nb_counts(
                 mean=mu_k_loop, l_c=lib_size_pert, theta=local_all_theta, rng=rng
             )
             writer.append_counts(pert_counts, perturbation_id=perturbation_id)

@@ -1,8 +1,155 @@
 import numpy as np
-from sklearn.metrics.pairwise import pairwise_kernels
+from anndata import AnnData
+from anndata.experimental import AnnCollection
 from scipy.stats import nbinom, poisson
+from sklearn.metrics.pairwise import pairwise_kernels
+
+from util.anndata_util import extract_rows, fit_control_incremental_pca, obs_has_key
 
 _EPS = 1e-12
+
+
+def distribution_distance(
+    obs: AnnData | AnnCollection,
+    pred: AnnData | AnnCollection,
+    layer_obs: str,
+    layer_pred: str,
+    control_label: str | int | float = -1,
+    method: str = "parametric",
+    distribution_form: str = "NB",
+    dist_type: str = "JS-divergence",
+    kernel: str = "rbf",
+    use_pca: bool = False,
+    n_pca_components: int = 50,
+    ipca_batch_size: int = 1024,
+    **kernel_params,
+):
+    """
+    Calculate a distance between the distributions of observed and predicted values, either by:
+      1) fitting parametric distributions to both observed and predicted data (per gene),
+         then computing a distance between the two fitted distributions (per gene),
+         and returning the mean distance across genes.
+      2) directly computing a kernel-based distance (MMD) between the two sets of samples.
+
+    Went through all perturbation types, calculate the distance for each perturbation, and return the median distance across perturbations.
+    Arguments:
+        obs: observed post-perturbation profile, an object of annData or annCollection. 
+        pred: predicted post-perturbation profile, an object of annData or annCollection
+        layer_obs: layer key in obs to use for distance calculation.
+        layer_pred: layer key in pred to use for distance calculation.
+        control_label: label in obs.obs['perturbation'] and pred.obs['perturbation'] that indicates control samples to exclude.
+         Default is -1, but this should be set according to the actual control label in the data.
+        method: "parametric" or "mmd"
+        distribution_form: if method=="parametric", one of "NB" (Negative Binomial), "Poisson", "ZINB" (Zero-Inflated NB).
+            NB/ZINB are fit in the common (mu, theta) parameterization:
+                Var = mu + mu^2 / theta
+        dist_type: if method=="parametric", "JS-divergence" or "Wasserstein" (1-Wasserstein on counts).
+        kernel: if method=="mmd", kernel type to use in MMD calculation. Default is 'rbf'.
+            choices are 'rbf', 'linear', 'poly', 'sigmoid'.
+        use_pca: if True, fit IncrementalPCA on obs control cells only
+            (obs.obs["perturbation"] == control_label), then transform all
+            non-control cells from both obs and pred before distance computation.
+            Currently supported only when method=="mmd".
+        n_pca_components: number of components for IncrementalPCA when
+            use_pca=True.
+        ipca_batch_size: batch size used for IncrementalPCA partial_fit when
+            use_pca=True.
+        **kernel_params: optional kernel parameters passed to sklearn.metrics.pairwise.pairwise_kernels
+            e.g., for rbf/sigmoid: gamma=...
+                  for poly: degree=..., gamma=..., coef0=...
+                  for sigmoid: gamma=..., coef0=...
+    Returns:
+        A float representing the distribution distance between obs and pred.
+    """
+
+    method_key = method.strip().lower()
+    if method_key not in {"parametric", "mmd"}:
+        raise ValueError(
+            f"Unknown method: {method}. Expected 'parametric' or 'mmd'."
+        )
+    if use_pca and method_key != "mmd":
+        raise ValueError(
+            "use_pca=True is currently supported only when method='mmd'."
+        )
+
+    for name, data_obj in (("obs", obs), ("pred", pred)):
+        obs_df = getattr(data_obj, "obs", None)
+        if not obs_has_key(obs_df, "perturbation"):
+            raise KeyError(f"{name}.obs must contain a 'perturbation' column.")
+
+    if obs.n_vars != pred.n_vars:
+        raise ValueError(
+            f"obs and pred must have the same number of genes. "
+            f"Got {obs.n_vars} vs {pred.n_vars}."
+        )
+
+    obs_labels = np.asarray(obs.obs["perturbation"])
+    pred_labels = np.asarray(pred.obs["perturbation"])
+
+    # remove control labels, based on the control_label value
+    obs_perts = set(np.unique(obs_labels)) - {control_label}
+    pred_perts = set(np.unique(pred_labels)) - {control_label}
+
+    if obs_perts != pred_perts:
+        missing_in_pred = obs_perts - pred_perts
+        missing_in_obs = pred_perts - obs_perts
+        raise ValueError(
+            "obs and pred have mismatched perturbation labels (excluding control). "
+            f"Missing in pred: {missing_in_pred}; missing in obs: {missing_in_obs}."
+        )
+
+    if not obs_perts or not pred_perts:
+        return float("nan")
+
+    try:
+        ordered_perts = sorted(obs_perts)
+    except TypeError:
+        ordered_perts = sorted(obs_perts, key=lambda x: str(x))
+
+    obs_idx_by_pert = {pert: np.flatnonzero(obs_labels == pert) for pert in ordered_perts}
+    pred_idx_by_pert = {pert: np.flatnonzero(pred_labels == pert) for pert in ordered_perts}
+
+    pca_model = None
+    if use_pca:
+        pca_model = fit_control_incremental_pca(
+            data_obj=obs,
+            layer_key=layer_obs,
+            control_label=control_label,
+            n_pca_components=n_pca_components,
+            batch_size=ipca_batch_size,
+            obs_key="perturbation",
+            data_name="obs",
+        )
+
+    per_pert_dists: list[float] = []
+    for pert in ordered_perts:
+        x_obs = extract_rows(obs, obs_idx_by_pert[pert], layer_obs)
+        x_pred = extract_rows(pred, pred_idx_by_pert[pert], layer_pred)
+        if x_obs.size == 0 or x_pred.size == 0:
+            d = np.nan
+        else:
+            if pca_model is not None:
+                x_obs = pca_model.transform(x_obs).astype(np.float64, copy=False)
+                x_pred = pca_model.transform(x_pred).astype(np.float64, copy=False)
+
+            if method_key == "parametric":
+                d = param_dist_pert(
+                    x_obs=x_obs,
+                    x_pred=x_pred,
+                    parametric_form=distribution_form,
+                    dist_type=dist_type,
+                )
+            elif method_key == "mmd":
+                d = mmd_pert(
+                    x_obs=x_obs,
+                    x_pred=x_pred,
+                    kernel=kernel,
+                    **kernel_params,
+                )
+
+        per_pert_dists.append(d)
+
+    return np.nanmedian(per_pert_dists) if per_pert_dists else np.nan
 
 
 def mmd_pert(
@@ -16,8 +163,8 @@ def mmd_pert(
     for one perturbation.
 
     Arguments:
-        x_obs: observed post-perturbation profile. Shape: (n_cells, n_genes)
-        x_pred: predicted post-perturbation profile. Shape: (n_cells, n_genes)
+        x_obs: observed post-perturbation profile. Shape: (n_cells, n_dims)
+        x_pred: predicted post-perturbation profile. Shape: (n_cells, n_dims)
         kernel: Kernel type to use in MMD calculation. Default is 'rbf'.
             choices are 'rbf', 'linear', 'poly', 'sigmoid'.
         **kernel_params: optional kernel parameters passed to sklearn.metrics.pairwise.pairwise_kernels
@@ -34,7 +181,7 @@ def mmd_pert(
         x_pred = x_pred.reshape(1, -1)
 
     if x_obs.shape[1] != x_pred.shape[1]:
-        raise ValueError(f"x_obs and x_pred must have the same number of genes (features). "
+        raise ValueError(f"x_obs and x_pred must have the same number of dimensions (features). "
                          f"Got {x_obs.shape[1]} and {x_pred.shape[1]}.")
 
     m, n = x_obs.shape[0], x_pred.shape[0]
@@ -56,14 +203,14 @@ def mmd_pert(
     return float(mmd2)
 
 
-def parametric_dist(
+def param_dist_pert(
         x_obs: np.ndarray,
         x_pred: np.ndarray,
         parametric_form: str = "NB",
         dist_type: str = "JS-divergence",
 ) -> float:
     """
-    Calculate distribution distance between observed and predicted values:
+    Calculate distribution distance between observed and predicted values for each perturbation,
       1) fit parametric distributions to both observed and predicted data (per gene),
       2) compute a distance between the two fitted distributions (per gene),
       3) return the mean distance across genes.
@@ -76,9 +223,6 @@ def parametric_dist(
                 Var = mu + mu^2 / theta
         dist_type: "JS-divergence" or "Wasserstein" (1-Wasserstein on counts).
     """
-    # ----------------------------
-    # Helpers: fitting + pmf + ppf
-    # ----------------------------
     q_tail = 1.0 - 1e-8          # truncation quantile
     kmax_cap = 10_000            # safety cap to avoid huge loops
 
@@ -162,9 +306,6 @@ def parametric_dist(
         else:
             raise ValueError(f"Unknown parametric_form: {form}")
 
-    # ----------------------------
-    # Helpers: distances on pmfs
-    # ----------------------------
     def _js_divergence(p: np.ndarray, q: np.ndarray) -> float:
         m = 0.5 * (p + q)
         # KL(p||m) and KL(q||m)
@@ -178,13 +319,23 @@ def parametric_dist(
         cdf_q = np.cumsum(q)
         return float(np.sum(np.abs(cdf_p - cdf_q)))
 
-    # ----------------------------
-    # Main
-    # ----------------------------
     x_obs = np.asarray(x_obs, dtype=float)
     x_pred = np.asarray(x_pred, dtype=float)
-    if x_obs.shape != x_pred.shape:
-        raise ValueError(f"x_obs and x_pred must have the same shape, got {x_obs.shape} vs {x_pred.shape}")
+    if x_obs.ndim == 1:
+        x_obs = x_obs.reshape(1, -1)
+    if x_pred.ndim == 1:
+        x_pred = x_pred.reshape(1, -1)
+
+    if x_obs.ndim != 2 or x_pred.ndim != 2:
+        raise ValueError(f"x_obs and x_pred must be 1D or 2D arrays, got {x_obs.ndim}D and {x_pred.ndim}D.")
+
+    if x_obs.shape[1] != x_pred.shape[1]:
+        raise ValueError(
+            f"x_obs and x_pred must have the same number of genes, "
+            f"got {x_obs.shape[1]} vs {x_pred.shape[1]}."
+        )
+    if x_obs.shape[0] == 0 or x_pred.shape[0] == 0:
+        return float("nan")
 
     # Count models: clip negatives
     x_obs = np.clip(x_obs, 0.0, None)
@@ -193,11 +344,12 @@ def parametric_dist(
     form = parametric_form.strip().upper()
     dist = dist_type.strip().upper()
 
-    n_cells, n_genes = x_obs.shape
+    n_cells_obs, n_genes = x_obs.shape
+    n_cells_pred = x_pred.shape[0]
     mu_obs = x_obs.mean(axis=0)
     mu_pred = x_pred.mean(axis=0)
-    var_obs = x_obs.var(axis=0, ddof=1) if n_cells > 1 else np.zeros(n_genes)
-    var_pred = x_pred.var(axis=0, ddof=1) if n_cells > 1 else np.zeros(n_genes)
+    var_obs = x_obs.var(axis=0, ddof=1) if n_cells_obs > 1 else np.zeros(n_genes)
+    var_pred = x_pred.var(axis=0, ddof=1) if n_cells_pred > 1 else np.zeros(n_genes)
     p0_obs = (x_obs == 0).mean(axis=0)
     p0_pred = (x_pred == 0).mean(axis=0)
 
