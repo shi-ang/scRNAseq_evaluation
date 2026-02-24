@@ -13,12 +13,8 @@ import anndata as ad
 from anndata.experimental import AnnCollection
 
 from .util import est_cost, systematic_variation, intra_correlation, sum_and_sumsq, stratified_split_ac, get_pseudobulks_and_degs
-from metrics.perturbation_effect.pearson import pearson_pert
-from metrics.perturbation_effect.perturbation_discrimination_score import pds
-from metrics.perturbation_effect.r_square import r2_score_pert
+from analyses.evaluator import evaluation, get_eval_perturbation_ids
 from metrics.reconstruction.vendi_score import vendi_score
-from metrics.reconstruction.mean_error import mean_error_pert
-from metrics.reconstruction.distribution_distance import distribution_distance
 from data.dgp import synthetic_DGP, synthetic_causalDGP
 from models.scvi_pert import ScviPerturbation
 
@@ -39,159 +35,6 @@ _PARAM_RANGES = {
 _MODELS = ["Control", "Average", "scVI"]
 # _MODELS = ["scVI"]
 _NORM_LAYER_KEY = "normalized_log1p"
-
-
-def evaluation(
-        pred,
-        obs,
-        mu_pred,
-        mu_obs,
-        mu_control_obs,
-        mu_pool_obs,
-        DEGs_stats,
-        model: str = "Average",
-):
-    """
-    Perform evaluation of the predicted single-cell profiles.
-    
-    :param pred: predicted single-cell profiles matrix, shape (n_cells, n_genes)
-    :param obs: observed single-cell profiles matrix, shape (n_cells, n_genes)
-    :param mu_pred: predicted mean expression matrix, shape (n_perturbations, n_genes)
-    :param mu_obs: observed mean expression matrix, shape (n_perturbations, n_genes)
-    :param mu_control_obs: observed mean expression matrix for control, shape (n_genes)
-    :param mu_pool_obs: observed mean expression matrix for pooled data, shape (n_perturbations, n_genes)
-    :param DEGs_stats: list of differentially expressed genes masks for each perturbation, from statistical testing
-    :param model: The prediction model used, affects certain calculations
-    """
-    n_perts = mu_obs.shape[0]
-    if mu_pred is None:
-        if pred is None:
-            raise ValueError("pred must be provided when mu_pred is None.")
-        if "perturbation" not in pred.obs.columns:
-            raise KeyError("pred.obs must contain 'perturbation' when mu_pred is None.")
-
-        if model == "scVI":
-            layer_key = "scvi_normalized"
-        else:
-            raise NotImplementedError(f"Model '{model}' is not implemented for on-the-fly pseudobulk calculation when mu_pred is None.")
-        # get pseudobulk for predicted profiles
-        mu_pred = np.empty((n_perts, pred.shape[1]), dtype=np.float32)
-        for p_idx in range(n_perts):
-            pert_mask = pred.obs["perturbation"] == p_idx
-            if pert_mask.sum() == 0:
-                raise ValueError(f"No cells found for perturbation index {p_idx} in pred.")
-            mu_pred[p_idx, :] = pred.layers[layer_key][pert_mask, :].mean(axis=0)
-        
-    
-    if pred is not None and obs is not None:
-        parametric_distance = distribution_distance(
-            obs=obs,
-            pred=pred,
-            layer_obs=_NORM_LAYER_KEY,
-            layer_pred=layer_key,
-            control_label=-1,
-            method="parametric",
-            distribution_form="NB",
-            dist_type="JS-divergence",
-            use_pca=False,
-        )
-
-        mmd_distance = distribution_distance(
-            obs=obs,
-            pred=pred,
-            layer_obs=_NORM_LAYER_KEY,
-            layer_pred=layer_key,
-            control_label=-1,
-            method="mmd",
-            distribution_form="NB",
-            use_pca=True,
-        )
-
-        # measure vendi score for the predicted profiles
-        vendi_score_pred = vendi_score(
-            ac=pred,
-            n_pca_components=30,
-            layer_key=layer_key,
-        )
-
-    else:
-        parametric_distance = np.nan
-        mmd_distance = np.nan
-        vendi_score_pred = np.nan
-
-    # PDS(Perturbation Discrimination Score) calculation
-    # PDS-l1 and PDS-l2 are independent of reference, because reference will be cancelled out
-    # TODO: check if the scores are the same 
-    pds_l1_score = pds(
-        X_obs=mu_obs,
-        X_pred=mu_pred,
-        reference=mu_control_obs, # can be any reference, because it will be cancelled out in l1/l2
-        metric="l1",
-    )
-
-    pds_l2_score = pds(
-        X_obs=mu_obs,
-        X_pred=mu_pred,
-        reference=mu_control_obs, # can be any reference, because it will be cancelled out in l1/l2
-        metric="l2",
-    )
-
-    # PSD-cosine uses reference, so we use mu_control as reference
-    # TODO: this should not be the same, check it
-    pds_cosine_score = pds(
-        X_obs=mu_obs,
-        X_pred=mu_pred,
-        reference=mu_control_obs,
-        metric="cosine",
-    )
-    
-    results_tracker = {
-        'pearson': [],
-        'pearson_degs': [],
-        'mae': [],
-        'mae_degs': [],
-        'mse': [],
-        'mse_degs': [],
-        'r2': [],
-        'r2_degs': [],
-    }
-    # Calculate metrics per perturbation
-    # without postfix is for all genes
-    # "_degs" is for the genes identified as DEGs by the t-test (statistical DEGs)
-    for ptb_idx in range(n_perts):
-        DEGs_stats_ptb = DEGs_stats[ptb_idx]
-        
-        mu_obs_ptb = mu_obs[ptb_idx].astype(np.float32, copy=False)
-        mu_pred_ptb = mu_pred[ptb_idx].astype(np.float32, copy=False)
-        if model != "Control":
-            results_tracker['pearson'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs))
-            results_tracker['pearson_degs'].append(pearson_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, DEGs=DEGs_stats_ptb))
-
-        results_tracker['mae'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute"))
-        results_tracker['mse'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared"))
-        results_tracker['mae_degs'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="absolute", weights=DEGs_stats_ptb.astype(np.float32)))
-        results_tracker['mse_degs'].append(mean_error_pert(mu_obs_ptb, mu_pred_ptb, type="squared", weights=DEGs_stats_ptb.astype(np.float32)))
-
-        results_tracker['r2'].append(r2_score_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs))
-        results_tracker['r2_degs'].append(r2_score_pert(mu_obs_ptb, mu_pred_ptb, reference=mu_control_obs, weights=DEGs_stats_ptb.astype(np.float32)))
-
-    results_final = {
-        'pearson': np.nanmedian(results_tracker['pearson']) if results_tracker['pearson'] else np.nan,
-        'pearson_degs': np.nanmedian(results_tracker['pearson_degs']) if results_tracker['pearson_degs'] else np.nan,
-        'mae': np.nanmedian(results_tracker['mae']) if results_tracker['mae'] else np.nan,
-        'mae_degs': np.nanmedian(results_tracker['mae_degs']) if results_tracker['mae_degs'] else np.nan,
-        'mse': np.nanmedian(results_tracker['mse']) if results_tracker['mse'] else np.nan,
-        'mse_degs': np.nanmedian(results_tracker['mse_degs']) if results_tracker['mse_degs'] else np.nan,
-        'r2': np.nanmedian(results_tracker['r2']) if results_tracker['r2'] else np.nan,
-        'r2_degs': np.nanmedian(results_tracker['r2_degs']) if results_tracker['r2_degs'] else np.nan,
-        'parametric_distance': parametric_distance,
-        'mmd_distance': mmd_distance,
-        'vendi_score': vendi_score_pred,
-        'pds_l1': pds_l1_score,
-        'pds_l2': pds_l2_score,
-        'pds_cosine': pds_cosine_score,
-    }
-    return results_final
 
 
 def simulate_one_run(
@@ -411,6 +254,9 @@ def simulate_one_run(
             method="t-test",
             layer_key=_NORM_LAYER_KEY,
         )
+        test_perturbation_ids = get_eval_perturbation_ids(obs=ac_test, control_label=-1, strict_match=False)
+        test_perturbation_ids = np.asarray(test_perturbation_ids, dtype=np.int32)
+        mu_obs_test = mu_obs[test_perturbation_ids, :]
 
         all_results = []
         for model in _MODELS:
@@ -418,9 +264,9 @@ def simulate_one_run(
             mu_pred = None
             ad_test_pred = None
             if model == "Control":
-                mu_pred = np.tile(mu_control_train, (P, 1))
+                mu_pred = np.tile(mu_control_train, (test_perturbation_ids.size, 1))
             elif model == "Average":
-                mu_pred = np.tile(mu_pool_train, (P, 1))
+                mu_pred = np.tile(mu_pool_train, (test_perturbation_ids.size, 1))
             elif model == "scVI":
                 scvi_model = ScviPerturbation(
                     data=collection,
@@ -437,7 +283,7 @@ def simulate_one_run(
                     n_layers=3,
                     gene_likelihood="zinb",
                     dispersion="gene",
-                    max_epochs=100,
+                    max_epochs=200,
                     batch_size=512,
                     early_stopping=True,
                     dataloader_num_workers=0,
@@ -448,13 +294,18 @@ def simulate_one_run(
             model_results = evaluation(
                 pred=ad_test_pred,
                 obs=ac_test,
-                mu_obs=mu_obs,
                 mu_pred=mu_pred,
+                mu_obs=mu_obs_test,
                 mu_control_obs=mu_control_test,
                 mu_pool_obs=mu_pool_test,
                 DEGs_stats=degs_test,
+                perturbation_ids=test_perturbation_ids,
                 model=model,
+                layer_obs=_NORM_LAYER_KEY,
+                control_label=-1,
+                use_pca_for_mmd=True,
             )
+
             model_results.update({
                 'model': model,
                 'execution_time': time.time() - start_time,
@@ -527,7 +378,7 @@ def _pool_worker_timed(task_info_dict):
             'mae', 'mae_degs',
             'mse', 'mse_degs',
             'r2', 'r2_degs',
-            'parametric_distance', 'mmd_distance', 'vendi_score',
+            'parametric_distance', 'mmd_distance', 'vendi_score_test',
             'pds_l1', 'pds_l2', 'pds_cosine',
             'model', 'execution_time',
             'sparsity', 'median_library_size', 'systematic_variation', 'intra_corr', 'vendi_score',
@@ -620,7 +471,7 @@ def run_random_sweep(
             'mae', 'mae_degs',
             'mse', 'mse_degs',
             'r2', 'r2_degs',
-            'parametric_distance', 'mmd_distance', 'vendi_score',
+            'parametric_distance', 'mmd_distance', 'vendi_score_test',
             'pds_l1', 'pds_l2', 'pds_cosine',
             'sparsity', 'vendi_score'
         }
@@ -652,13 +503,13 @@ def run_random_sweep(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run random sweep simulations.")
     parser.add_argument("--output_dir", type=str, default="results/synthetic_simulations/random_sweep_results", help="Directory to save sweep results")
-    parser.add_argument("--n_trials", type=int, default=5, help="Number of trials to run")
+    parser.add_argument("--n_trials", type=int, default=4, help="Number of trials to run")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of worker processes for multiprocessing")
     parser.add_argument("--multiprocessing", action="store_true", help="Enable multiprocessing")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--max_cells_per_chunk", type=int, default=2048, help="Maximum cells per generated h5ad chunk")
     parser.add_argument("--ann_batch_size", type=int, default=1024, help="Batch size when iterating AnnCollection")
-    parser.add_argument("--dataset", type=str, default="synthetic_two", choices=["synthetic_one", "synthetic_two"], help="Dataset to use for the simulation")
+    parser.add_argument("--dataset", type=str, default="synthetic_one", choices=["synthetic_one", "synthetic_two"], help="Dataset to use for the simulation")
     args = parser.parse_args()
 
     # Set seed

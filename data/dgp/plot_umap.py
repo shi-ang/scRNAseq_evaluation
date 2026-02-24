@@ -104,6 +104,7 @@ def main() -> None:
         all_theta=all_theta,
         trial_id_for_rng=args.seed,
         output_dir=str(output_dir),
+        mask_method="power-law",
         max_cells_per_chunk=args.max_cells_per_chunk,
         normalize=True,
         normalized_layer_key=args.normalized_layer_key,
