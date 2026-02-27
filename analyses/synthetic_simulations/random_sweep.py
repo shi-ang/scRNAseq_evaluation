@@ -76,22 +76,22 @@ def simulate_one_run(
                 all_theta=all_theta,
                 control_mu=control_mu,
                 pert_mu=pert_mu,
-                trial_id_for_rng=trial_id_for_rng,
+                seed=trial_id_for_rng,
                 output_dir=tmp_dir,
                 max_cells_per_chunk=max_cells_per_chunk,
                 normalize=normalize,
                 normalized_layer_key=_NORM_LAYER_KEY,
             )
         elif dataset_name == "synthetic_two":
-            chunk_paths = synthetic_causalDGP(
+            chunk_paths, _ = synthetic_causalDGP(
                 G=G,
                 N0=N0,
                 Nk=Nk,
                 P=P,
                 mu_l=mu_l,
                 all_theta=all_theta,
-                mask_method='Erdos-Renyi',
-                trial_id_for_rng=trial_id_for_rng,
+                mask_method='Power-law',
+                seed=trial_id_for_rng,
                 output_dir=tmp_dir,
                 max_cells_per_chunk=max_cells_per_chunk,
                 normalize=normalize,

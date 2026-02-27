@@ -30,6 +30,13 @@ def _normalize_and_log1p(matrix, normalize=True, target_sum=1e4):
     return matrix
 
 
+def sample_unif_pm(rng: np.random.Generator, low: float, high: float, size) -> np.ndarray:
+    """Uniform magnitude in [low, high] times random sign ±1."""
+    mag = rng.uniform(low, high, size=size)
+    sign = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=size)
+    return mag * sign
+
+
 def sample_nb_counts(mean, l_c, theta, rng): # theta kept as generic parameter name for this utility function
     """
     Generate individual cell profiles from NB distribution

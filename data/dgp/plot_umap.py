@@ -96,7 +96,7 @@ def main() -> None:
     all_theta = all_params_df['n'].values
 
     # Keep this demo fixed at P=5 as requested.
-    chunk_paths = synthetic_causalDGP(
+    chunk_paths, all_affected_masks = synthetic_causalDGP(
         G=args.G,
         N0=args.N0,
         Nk=args.Nk,

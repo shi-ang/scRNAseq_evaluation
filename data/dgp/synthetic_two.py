@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Callable, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
 import numpy as np
 import pandas as pd
-from scipy import sparse
 import scipy.sparse.linalg as spla
-import os
-import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
+from scipy import sparse
 
-from .util import ChunkedAnnDataWriter, sample_nb_counts
-
-matplotlib.use("Agg")
-
+from .util import ChunkedAnnDataWriter, sample_nb_counts, sample_unif_pm
 
 def _softplus(x: np.ndarray) -> np.ndarray:
     """
@@ -26,37 +24,29 @@ def _softplus(x: np.ndarray) -> np.ndarray:
     return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
 
 
-def _unif_pm(rng: np.random.Generator, low: float, high: float, size) -> np.ndarray:
-    """Uniform magnitude in [low, high] times random sign ±1."""
-    mag = rng.uniform(low, high, size=size)
-    sign = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=size)
-    return mag * sign
-
-
-def _build_A_erdos_renyi(
+def _build_matrix_erdos_renyi(
     G: int,
     rng: np.random.Generator,
     expected_edges_per_gene: int = 10,
 ) -> sparse.csr_matrix:
     """
-    Build sparse A with ~expected_edges_per_gene nonzeros per row (target gene),
+    Build sparse with ~expected_edges_per_gene nonzeros per row (target gene),
     i.e., ~10 regulators per gene.
 
     A_{i,j} != 0 means gene j directly influences gene i in the linear drift.
     """
+    edges_per_gene = min(expected_edges_per_gene, G - 1)
     rows: list[int] = []
     cols: list[int] = []
     data: list[float] = []
 
     for i in range(G):
-        if expected_edges_per_gene == 0:
-            continue
         # choose regulators j != i
         # (for large G, this is fast enough and avoids dense masks)
-        regs = rng.choice(G - 1, size=expected_edges_per_gene, replace=False)
+        regs = rng.choice(G - 1, size=edges_per_gene, replace=False)
         regs = regs + (regs >= i)  # shift up to skip i
-        w = _unif_pm(rng, 1.0, 3.0, size=expected_edges_per_gene)
-        rows.extend([i] * expected_edges_per_gene)
+        w = sample_unif_pm(rng, 1.0, 3.0, size=edges_per_gene)
+        rows.extend([i] * edges_per_gene)
         cols.extend(regs.tolist())
         data.extend(w.tolist())
 
@@ -66,7 +56,7 @@ def _build_A_erdos_renyi(
     return A
 
 
-def _build_A_power_law_BA(
+def _build_matrix_power_law(
     G: int,
     rng: np.random.Generator,
     m: int = 10,
@@ -87,7 +77,7 @@ def _build_A_power_law_BA(
 
     # Start with a small seed set. We do not require m0 >= m because m is treated
     # as an average number of links, and per-node links are sampled stochastically.
-    m0 = 12 if G >= 12 else max(G, 2)
+    m0 = min(12, G)
     degrees = np.zeros(G, dtype=np.float64)
 
     # Seed: connect nodes [0..m0-1] in a simple chain to initialize degrees
@@ -103,7 +93,7 @@ def _build_A_power_law_BA(
 
         rows.append(dst)
         cols.append(src)
-        data.append(float(_unif_pm(rng, 1.0, 3.0, size=()).item()))
+        data.append(float(sample_unif_pm(rng, 1.0, 3.0, size=()).item()))
 
     # Grow graph
     for new in range(m0, G):
@@ -130,7 +120,7 @@ def _build_A_power_law_BA(
 
             rows.append(dst)
             cols.append(src)
-            data.append(float(_unif_pm(rng, 1.0, 3.0, size=()).item()))
+            data.append(float(sample_unif_pm(rng, 1.0, 3.0, size=()).item()))
 
             degrees[old] += 1
             degrees[new] += 1
@@ -141,7 +131,10 @@ def _build_A_power_law_BA(
     return A
 
 
-def _shift_causal_matrix(A: sparse.csr_matrix, target_max_real_eig: float = -0.5) -> Tuple[sparse.csr_matrix, float]:
+def _shift_causal_matrix(
+    A: sparse.csr_matrix, 
+    target_max_real_eig: float = -0.5
+) -> sparse.csr_matrix:
     """
     Shift the causal matrix by a constant diagonal so that max real-part eigenvalue <= target_max_real_eig.
 
@@ -149,8 +142,6 @@ def _shift_causal_matrix(A: sparse.csr_matrix, target_max_real_eig: float = -0.5
     the symmetric part (A + A.T)/2 which provides an upper bound on spectral abscissa.
     """
     G = A.shape[0]
-    s_est = None
-
     try:
         # largest real part eigenvalue estimate
         vals = spla.eigs(A, k=1, which="LR", return_eigenvectors=False, tol=1e-2, maxiter=2000)
@@ -163,6 +154,25 @@ def _shift_causal_matrix(A: sparse.csr_matrix, target_max_real_eig: float = -0.5
 
     A_stable = A - (s_est - target_max_real_eig) * sparse.eye(G, format="csr", dtype=np.float32)
     return A_stable
+
+
+def _build_base_matrix(
+    G: int, rng: np.random.Generator, mask_method: str
+) -> sparse.csr_matrix:
+    method = mask_method.strip().lower().replace("_", "-")
+    builders: dict[str, Callable[..., sparse.csr_matrix]] = {
+        "power-law": _build_matrix_power_law,
+        "erdos-renyi": _build_matrix_erdos_renyi,
+    }
+    if method not in builders:
+        raise ValueError(f"Unknown mask_method: {mask_method}")
+    return builders[method](G=G, rng=rng)
+
+
+def _build_bc_vectors(bias: np.ndarray, c_q: np.ndarray) -> list[np.ndarray]:
+    out = [bias.copy()]
+    out.extend(bias + c_q[p] for p in range(c_q.shape[0]))
+    return out
 
 
 def _swap_matrix(
@@ -333,7 +343,7 @@ def synthetic_causalDGP(
     normalize=True, # Whether to normalize before log1p for the persisted layer
     normalized_layer_key: str = "normalized_log1p", # Layer name for normalized/log1p values
     visualize=False, # Whether to visualize the A matrix and its spectrum for debugging
-) -> list[str]:
+) -> Tuple[list[str], list[np.ndarray]]:
     """
     End-to-end synthetic scRNA-seq generator:
 
@@ -349,17 +359,23 @@ def synthetic_causalDGP(
       - .obs["cell_type"]: Bernoulli cell type labels (0/1)
 
     Returns:
-      - chunk_paths: list[str]
+      - chunk_paths: list[str], h5ad files containing sparse count chunks
+      - all_affected_masks: list[np.ndarray], one mask per perturbation indicating which genes are affected
     """
-    if seed is None:
-        rng = np.random.default_rng(42)
-    else:
-        rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(42 if seed is None else seed)
 
     if output_dir is None:
         raise ValueError("output_dir must be provided.")
     if all_theta is None:
         raise ValueError("all_theta must be provided.")
+    if G <= 0:
+        raise ValueError(f"G must be positive, got {G}")
+    if N0 < 0 or Nk < 0 or P < 0:
+        raise ValueError(f"N0, Nk, and P must be non-negative, got N0={N0}, Nk={Nk}, P={P}")
+    if max_cells_per_chunk <= 0:
+        raise ValueError(
+            f"max_cells_per_chunk must be positive, got {max_cells_per_chunk}"
+        )
     if not (0.0 <= swap_fraction <= 1.0):
         raise ValueError(
             f"swap_fraction must be in [0, 1], got {swap_fraction}"
@@ -372,16 +388,8 @@ def synthetic_causalDGP(
     indices = rng.choice(all_theta.size, size=G, replace=False)
     local_all_theta = np.maximum(all_theta[indices], 1e-6).astype(np.float32, copy=False)
 
-    # build shift function f_q(x) = Ax + b + c_q
-    mask_method = mask_method.lower()
-    if mask_method == "power-law":
-        A = _build_A_power_law_BA(G=G, rng=rng, m=10, strength=2.0, flip_prob=0.1)
-        # A_alter = _build_A_power_law_BA(G=G, rng=rng, m=10, strength=2.0, flip_prob=0.1)
-    elif mask_method == "erdos-renyi":
-        A = _build_A_erdos_renyi(G=G, rng=rng, expected_edges_per_gene=10)
-        # A_alter = _build_A_erdos_renyi(G=G, rng=rng, expected_edges_per_gene=10)
-    else:
-        raise ValueError(f"Unknown mask_method: {mask_method}")
+    # Build shift function f_q(x) = Ax + b + c_q.
+    A = _build_base_matrix(G=G, rng=rng, mask_method=mask_method)
     
     # Create a perturbed version of A by swapping X% (swap_fraction) of each row's nonzero edges
     # into zero positions. This preserves row sparsity and weight distribution.
@@ -390,22 +398,8 @@ def synthetic_causalDGP(
     A = _shift_causal_matrix(A, target_max_real_eig=-0.5)
     A_alter = _shift_causal_matrix(A_alter, target_max_real_eig=-0.5)
 
-    # TODO: -3, 3 bounds or -5, 5 bounds
     b_base = rng.uniform(-5.0, 5.0, size=G).astype(np.float32)
     b_base_alt = rng.uniform(-5.0, 5.0, size=G).astype(np.float32)
-    # direction = rng.standard_normal(G).astype(np.float32)
-    # mask = rng.uniform(0.0, 1.0, size=G)
-    # mask_threshold = 0.6
-    # direction[mask < mask_threshold] = 0.0
-    # direction_norm = float(np.linalg.norm(direction))
-    # direction /= direction_norm
-
-    # separation = 5  # controls how distinct the two cell types are
-    # half_sep = np.float32(separation / 2.0)
-    # b_list = [
-    #     (b_base - half_sep * direction).astype(np.float32, copy=False),  # type A (0)
-    #     (b_base + half_sep * direction).astype(np.float32, copy=False),  # type B (1)
-    # ]
 
     # Randomly reorder genes in A and b 
     perm = rng.permutation(G)
@@ -419,20 +413,26 @@ def synthetic_causalDGP(
 
     # sample perturbations c_q
     # Control is q=-1 with c=0. Perturbations are q=0..P-1.
-    NUM_PERTURB_GENES = 1
-    assert P * NUM_PERTURB_GENES <= G, "The possible number of perturbation targets exceeds total genes. Reduce P."
-    targets = rng.choice(G, size=P * NUM_PERTURB_GENES, replace=False).astype(np.int64).reshape(P, NUM_PERTURB_GENES)
-    targets.sort(axis=0)  # sort target indices for easier interpretation and debugging
-    shifts = _unif_pm(rng, 5.0, 15.0, size=(P, NUM_PERTURB_GENES)).astype(np.float32)
+    assert P <= G, f"The possible number of perturbation targets exceeds total genes. Reduce P. Got P={P}, G={G}"
+    targets = rng.choice(G, size=P, replace=False).astype(np.int64)
+    targets.sort()  # for better visualization in the color-map
+    shifts = sample_unif_pm(rng, 5.0, 15.0, size=(P)).astype(np.float32)
+    c_q = np.zeros((P, G), dtype=np.float32)
+    np.add.at(c_q, (np.arange(P), targets), shifts)
+
+    # Get affected genes masks 
+    # Find the non-zero entries in A^-1 * c_q[p] to determine which genes are affected by each perturbation.
+    # We can use the sparse linear solver to compute A^-1 @ c_q[p]
+    all_affected_masks = []
+    for p in range(P):
+        effect = spla.spsolve(A, c_q[p])
+        all_affected_masks.append(np.abs(effect) > 1e-6)
 
     if visualize:
         # Build stacked matrices [A^T; b] and [A_alter^T; b_alter],
         # each with shape (G + 1, G).
         Ab = np.vstack([A.toarray().T.astype(np.float32, copy=False), b_list[0][None, :]])
         Ab_alter = np.vstack([A_alter.toarray().T.astype(np.float32, copy=False), b_list[1][None, :]])
-        c_q = np.zeros((P, G), dtype=np.float32)
-        for p in range(P):
-            np.add.at(c_q[p], targets[p], shifts[p])
 
         # Black around 0, red for negative, blue for positive.
         # With vmin/vmax set to [-3, 3], 0 map to 0.5 on the color axis.
@@ -464,7 +464,7 @@ def synthetic_causalDGP(
                 spine.set_visible(False)
 
         cbar = fig.colorbar(im1, ax=axes.ravel().tolist(), shrink=0.85, pad=0.02)
-        cbar.set_label("Value (clipped to [-3, 3])")
+        cbar.set_label("Value")
 
         out_path = os.path.join(output_dir, "causal_effect_visualization.png")
         fig.savefig(out_path, bbox_inches="tight")
@@ -505,13 +505,9 @@ def synthetic_causalDGP(
 
     # Store bc vectors for each cell type as (b_type + c_q).
     # Index 0 corresponds to control bc (q=-1), then perturbations q=0..P-1.
-    bc_list: list[list[np.ndarray]] = [[], []]
-    for cell_type, b in enumerate(b_list):
-        bc_list[cell_type].append(b.copy())
-        for p in range(P):
-            bc = b.copy()
-            np.add.at(bc, targets[p], shifts[p])
-            bc_list[cell_type].append(bc)
+    bc_list: list[list[np.ndarray]] = [
+        _build_bc_vectors(bias=b, c_q=c_q) for b in b_list
+    ]
 
     var = pd.DataFrame(index=pd.Index([f"gene_{i}" for i in range(G)], name="gene"))
 
@@ -588,4 +584,4 @@ def synthetic_causalDGP(
 
     # flush tail
     writer.flush()
-    return writer.chunk_paths
+    return writer.chunk_paths, all_affected_masks

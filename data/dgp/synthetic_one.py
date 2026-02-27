@@ -1,6 +1,5 @@
-from typing import Tuple, List
+from typing import Tuple
 import numpy as np
-from scipy import sparse
 import pandas as pd
 
 from .util import ChunkedAnnDataWriter, sample_nb_counts
