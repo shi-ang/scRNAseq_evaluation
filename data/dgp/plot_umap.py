@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import sys
-import tempfile
 from pathlib import Path
 import pandas as pd
 import numpy as np
 import anndata as ad
+from anndata.experimental import AnnCollection
 from umap import UMAP
 from .synthetic_two import synthetic_causalDGP
+from metrics.reconstruction.vendi_score import vendi_score
 
 
 def _plot_umap_for_single_perturbation(
@@ -81,6 +81,7 @@ def main() -> None:
     parser.add_argument("--Nk", type=int, default=2048, help="Number of cells per perturbation.")
     parser.add_argument("--P", type=int, default=5, help="Number of perturbations.")
     parser.add_argument("--mu_l", type=float, default=1.0, help="Mean of log library size for the synthetic data.")
+    parser.add_argument("--swap-fraction", type=float, default=0.2, help="Fraction of A edges rewired to create A_alter.")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed.")
     parser.add_argument("--max-cells-per-chunk", type=int, default=1024, help="Chunk size for writing h5ad files.")
     parser.add_argument("--umap-n-neighbors", type=int, default=15, help="UMAP n_neighbors.")
@@ -102,7 +103,8 @@ def main() -> None:
         P=args.P,
         mu_l=args.mu_l,
         all_theta=all_theta,
-        trial_id_for_rng=args.seed,
+        swap_fraction=args.swap_fraction,
+        seed=args.seed,
         output_dir=str(output_dir),
         mask_method="power-law",
         max_cells_per_chunk=args.max_cells_per_chunk,
@@ -113,6 +115,9 @@ def main() -> None:
     print(f"Wrote {len(chunk_paths)} chunk files under: {output_dir}")
 
     adatas = [ad.read_h5ad(path) for path in chunk_paths]
+    ac = AnnCollection(adatas, join_vars="inner")
+    print(f"Vendi score for the dataset: {vendi_score(ac, layer_key=args.normalized_layer_key)}")
+
     adata = ad.concat(adatas, axis=0, join="outer", merge="same", index_unique=None)
 
     required_obs = {"cell_type", "perturbation"}
@@ -120,7 +125,12 @@ def main() -> None:
     if missing_obs:
         raise ValueError(f"Missing required obs columns: {sorted(missing_obs)}")
 
-    X = adata.layers[args.normalized_layer_key] if args.normalized_layer_key in adata.layers else adata.X
+    if args.normalized_layer_key in adata.layers:
+        print(f"Using layer '{args.normalized_layer_key}' for UMAP input.")
+        X = adata.layers[args.normalized_layer_key]
+    else:
+        print(f"Layer '{args.normalized_layer_key}' not found; falling back to adata.X for UMAP input.")
+        X = adata.X
     reducer = UMAP(
         n_components=2,
         n_neighbors=args.umap_n_neighbors,
@@ -132,6 +142,19 @@ def main() -> None:
 
     cell_type = adata.obs["cell_type"].to_numpy(dtype=np.int32, copy=False)
     perturbation = adata.obs["perturbation"].to_numpy(dtype=np.int32, copy=False)
+    control_idx = perturbation == -1
+    if np.any(control_idx):
+        control_fig_path = output_dir / "umap_cell_type_control.png"
+        _plot_umap_for_single_perturbation(
+            embedding=embedding[control_idx],
+            cell_type=cell_type[control_idx],
+            perturbation_id=-1,
+            output_path=control_fig_path,
+        )
+        print(f"Saved UMAP plot to: {control_fig_path}")
+    else:
+        print("No control cells (perturbation == -1) found; skipping control plot.")
+
     perturbation_values = np.unique(perturbation)
     perturbation_values = perturbation_values[perturbation_values >= 0]
 

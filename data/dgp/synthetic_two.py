@@ -165,7 +165,7 @@ def _shift_causal_matrix(A: sparse.csr_matrix, target_max_real_eig: float = -0.5
     return A_stable
 
 
-def _build_A_alter(
+def _swap_matrix(
     A: sparse.csr_matrix,
     rng: np.random.Generator,
     swap_fraction: float = 0.2,
@@ -313,8 +313,7 @@ class EMSampler:
             take = min(remaining, self.chains)
             out.append(self.x[:take].copy())
             remaining -= take
-            if remaining > 0:
-                self._step(self.thinning_steps)
+            self._step(self.thinning_steps)
 
         return np.vstack(out)
 
@@ -327,7 +326,8 @@ def synthetic_causalDGP(
     mu_l=1.0,   # mean of log library size
     all_theta=None, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
     mask_method: str = "Erdos-Renyi", # Erdos-Renyi or Power-law
-    trial_id_for_rng=None, # Optional for seeding RNG per trial
+    swap_fraction: float = 0.2,  # row-wise fraction of A edges rewired for A_alter
+    seed=None, # Optional for seeding RNG per trial
     output_dir=None, # Directory to persist temporary chunked h5ad files
     max_cells_per_chunk=2048,
     normalize=True, # Whether to normalize before log1p for the persisted layer
@@ -351,17 +351,26 @@ def synthetic_causalDGP(
     Returns:
       - chunk_paths: list[str]
     """
-    if trial_id_for_rng is None:
+    if seed is None:
         rng = np.random.default_rng(42)
     else:
-        rng = np.random.default_rng(trial_id_for_rng)
+        rng = np.random.default_rng(seed)
 
     if output_dir is None:
         raise ValueError("output_dir must be provided.")
+    if all_theta is None:
+        raise ValueError("all_theta must be provided.")
+    if not (0.0 <= swap_fraction <= 1.0):
+        raise ValueError(
+            f"swap_fraction must be in [0, 1], got {swap_fraction}"
+        )
 
     # Sample G elements from all_theta
-    indices = rng.choice(len(all_theta), size=G, replace=False)
-    local_all_theta = all_theta[indices]
+    all_theta = np.asarray(all_theta, dtype=np.float32).reshape(-1)
+    if all_theta.size < G:
+        raise ValueError(f"all_theta must have length >= G ({G}), got {all_theta.size}")
+    indices = rng.choice(all_theta.size, size=G, replace=False)
+    local_all_theta = np.maximum(all_theta[indices], 1e-6).astype(np.float32, copy=False)
 
     # build shift function f_q(x) = Ax + b + c_q
     mask_method = mask_method.lower()
@@ -374,47 +383,60 @@ def synthetic_causalDGP(
     else:
         raise ValueError(f"Unknown mask_method: {mask_method}")
     
-    # Create a perturbed version of A by swapping 20% of each row's nonzero edges
+    # Create a perturbed version of A by swapping X% (swap_fraction) of each row's nonzero edges
     # into zero positions. This preserves row sparsity and weight distribution.
-    A_alter = _build_A_alter(A=A, rng=rng, swap_fraction=0.2)
+    A_alter = _swap_matrix(A=A, rng=rng, swap_fraction=swap_fraction)
 
     A = _shift_causal_matrix(A, target_max_real_eig=-0.5)
     A_alter = _shift_causal_matrix(A_alter, target_max_real_eig=-0.5)
+
+    # TODO: -3, 3 bounds or -5, 5 bounds
+    b_base = rng.uniform(-5.0, 5.0, size=G).astype(np.float32)
+    b_base_alt = rng.uniform(-5.0, 5.0, size=G).astype(np.float32)
+    # direction = rng.standard_normal(G).astype(np.float32)
+    # mask = rng.uniform(0.0, 1.0, size=G)
+    # mask_threshold = 0.6
+    # direction[mask < mask_threshold] = 0.0
+    # direction_norm = float(np.linalg.norm(direction))
+    # direction /= direction_norm
+
+    # separation = 5  # controls how distinct the two cell types are
+    # half_sep = np.float32(separation / 2.0)
+    # b_list = [
+    #     (b_base - half_sep * direction).astype(np.float32, copy=False),  # type A (0)
+    #     (b_base + half_sep * direction).astype(np.float32, copy=False),  # type B (1)
+    # ]
+
+    # Randomly reorder genes in A and b 
+    perm = rng.permutation(G)
+    A = A[:, perm][perm, :]
+    A_alter = A_alter[:, perm][perm, :]
+    b_base = b_base[perm]
+    b_base_alt = b_base_alt[perm]
+
     A_list = [A, A_alter]
-
-    # TODO: change this to incorperate cell types
-    b_base = rng.uniform(-3.0, 3.0, size=G).astype(np.float32)
-    # b_base_alt = rng.uniform(-30.0, 30.0, size=G).astype(np.float32)
-    # b_list = [b_base, b_base_alt]
-    direction = rng.standard_normal(G).astype(np.float32)
-    direction_norm = float(np.linalg.norm(direction))
-    if direction_norm == 0.0:
-        # Numerical guard: extremely unlikely, but ensures we have a valid direction.
-        direction[0] = 1.0
-        direction_norm = 1.0
-    direction /= direction_norm
-
-    separation = 10.0  # controls how distinct the two cell types are
-    half_sep = np.float32(separation / 2.0)
-    b_list = [
-        (b_base - half_sep * direction).astype(np.float32, copy=False),  # type A (0)
-        (b_base + half_sep * direction).astype(np.float32, copy=False),  # type B (1)
-    ]
+    b_list = [b_base, b_base_alt]
 
     # sample perturbations c_q
     # Control is q=-1 with c=0. Perturbations are q=0..P-1.
-    targets = rng.choice(G, size=P, replace=False).astype(np.int64)
-    targets.sort()  # sort target indices for easier interpretation and debugging
-    shifts = _unif_pm(rng, 5.0, 15.0, size=P).astype(np.float32)
+    NUM_PERTURB_GENES = 1
+    assert P * NUM_PERTURB_GENES <= G, "The possible number of perturbation targets exceeds total genes. Reduce P."
+    targets = rng.choice(G, size=P * NUM_PERTURB_GENES, replace=False).astype(np.int64).reshape(P, NUM_PERTURB_GENES)
+    targets.sort(axis=0)  # sort target indices for easier interpretation and debugging
+    shifts = _unif_pm(rng, 5.0, 15.0, size=(P, NUM_PERTURB_GENES)).astype(np.float32)
 
     if visualize:
-        # Build stacked matrices [A; b] and [A_alter; b_alter], each with shape (G+1, G).
-        Ab = np.vstack([A.toarray().astype(np.float32, copy=False), b_list[0][None, :]])
-        Ab_alter = np.vstack([A_alter.toarray().astype(np.float32, copy=False), b_list[1][None, :]])
+        # Build stacked matrices [A^T; b] and [A_alter^T; b_alter],
+        # each with shape (G + 1, G).
+        Ab = np.vstack([A.toarray().T.astype(np.float32, copy=False), b_list[0][None, :]])
+        Ab_alter = np.vstack([A_alter.toarray().T.astype(np.float32, copy=False), b_list[1][None, :]])
+        c_q = np.zeros((P, G), dtype=np.float32)
+        for p in range(P):
+            np.add.at(c_q[p], targets[p], shifts[p])
 
         # Black around 0, red for negative, blue for positive.
         # With vmin/vmax set to [-3, 3], 0 map to 0.5 on the color axis.
-        cmap = LinearSegmentedColormap.from_list(
+        cmap_1 = LinearSegmentedColormap.from_list(
             "red_black_blue",
             [
                 (0.00, "#fdabab"),  # strong negative -> red
@@ -426,17 +448,20 @@ def synthetic_causalDGP(
         vmin, vmax = -3.0, 3.0
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 6), dpi=150, constrained_layout=True)
-        im0 = axes[0].imshow(Ab, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto", interpolation="nearest")
-        im1 = axes[1].imshow(Ab_alter, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto", interpolation="nearest")
+        im0 = axes[0].imshow(Ab, cmap=cmap_1, vmin=vmin, vmax=vmax, aspect="auto", interpolation="nearest")
+        im1 = axes[1].imshow(Ab_alter, cmap=cmap_1, vmin=vmin, vmax=vmax, aspect="auto", interpolation="nearest")
 
-        axes[0].set_title("[A; b] (cell type 0)")
-        axes[1].set_title("[A_alter; b_alter] (cell type 1)")
+        axes[0].set_title(r"$[A^\top; b]$ (cell type 0)")
+        axes[1].set_title(r"$[A_{\text{alter}}^\top; b_{\text{alter}}]$ (cell type 1)")
         for ax in axes:
-            ax.set_xlabel("Gene index (column)")
-            ax.set_ylabel("Gene index + b row")
+            ax.set_xlabel("Genes (downstream)")
+            ax.set_ylabel("Bias + Genes (upstream)")
             ax.set_yticks([0, G])
-            ax.set_yticklabels(["0", "b row"])
-            ax.axhline(G - 0.5, color="white", linewidth=0.5, alpha=0.8)
+            ax.set_yticklabels(["0", "b"])
+            ax.tick_params(axis="y", length=0)
+            ax.axhline(G - 0.5, color="white", linewidth=0.8, alpha=0.8)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
 
         cbar = fig.colorbar(im1, ax=axes.ravel().tolist(), shrink=0.85, pad=0.02)
         cbar.set_label("Value (clipped to [-3, 3])")
@@ -446,6 +471,37 @@ def synthetic_causalDGP(
         plt.close(fig)
         print(f"Saved causal effect heatmap visualization to: {out_path}")
 
+        cmap_2 = LinearSegmentedColormap.from_list(
+            "orange_white_green",
+            [
+                (0.00, "#faf9d1"),
+                (0.50, "#000000"),
+                (1.00, "#e1e2fd"),
+            ],
+            N=256,
+        )
+        cq_fig, cq_ax = plt.subplots(figsize=(14, 0.25 * P), dpi=150, constrained_layout=True)
+        cq_im = cq_ax.imshow(
+            c_q,
+            cmap=cmap_2,
+            vmin=-15.0,
+            vmax=15.0,
+            aspect="auto",
+            interpolation="nearest",
+        )
+        cq_ax.set_title(r"Shifts $\left[c_{q_1}, \dots, c_{q_k}\right]^\top$")
+        cq_ax.set_xlabel("Gene index")
+        cq_ax.set_ylabel("Perturbations")
+        for spine in cq_ax.spines.values():
+            spine.set_visible(False)
+        cq_cbar = cq_fig.colorbar(cq_im, ax=cq_ax, shrink=0.85, pad=0.02)
+        cq_cbar.set_label("Shift value")
+
+        cq_out_path = os.path.join(output_dir, "perturbation_shift.png")
+        cq_fig.savefig(cq_out_path, bbox_inches="tight")
+        plt.close(cq_fig)
+        print(f"Saved perturbation shift heatmap visualization to: {cq_out_path}")
+
 
     # Store bc vectors for each cell type as (b_type + c_q).
     # Index 0 corresponds to control bc (q=-1), then perturbations q=0..P-1.
@@ -454,7 +510,7 @@ def synthetic_causalDGP(
         bc_list[cell_type].append(b.copy())
         for p in range(P):
             bc = b.copy()
-            bc[targets[p]] += shifts[p]
+            np.add.at(bc, targets[p], shifts[p])
             bc_list[cell_type].append(bc)
 
     var = pd.DataFrame(index=pd.Index([f"gene_{i}" for i in range(G)], name="gene"))
@@ -468,8 +524,8 @@ def synthetic_causalDGP(
     )
 
     # EM sampling parameters
-    dt = 1e-4
-    burn_in_steps = 500
+    dt = 1e-3
+    burn_in_steps = 8000
     thinning_steps = 10
     chains_default = 64  # number of parallel chains per condition
 
@@ -511,12 +567,13 @@ def synthetic_causalDGP(
             if idx_type1.size > 0:
                 x_batch[idx_type1] = samplers[1].draw(int(idx_type1.size))
 
-            #softplus and normalize mu_batch to have unit library size of mu_l across genes, per cell
-            mu_batch = _softplus(x_batch)
-            # mu_batch = np.exp(x_batch) - 1.0 + 1e-8  # softplus with small epsilon to avoid log(0)
-            # mu_batch_sum = mu_batch.sum(axis=0, keepdims=True)
-            # print(f"mu_batch_shape: {mu_batch.shape}, mu_batch_sum_shape: {mu_batch_sum.shape}")
-            # mu_batch = mu_batch / (mu_batch_sum + 1e-8)
+            # Softplus and normalize mu per cell (rows) so each cell has unit total mean.
+            # NOTE: axis=1 is required here; axis=0 can collapse structure across cells.
+            mu_batch = _softplus(x_batch).astype(np.float32, copy=False)
+            mu_batch = np.maximum(mu_batch, 1e-8, out=mu_batch)
+            mu_batch_sum = mu_batch.sum(axis=1, keepdims=True, dtype=np.float32)
+            mu_batch_sum[mu_batch_sum <= 0.0] = 1.0
+            mu_batch = mu_batch / mu_batch_sum
 
             lib_size_pert = rng.lognormal(
                 mean=mu_l, sigma=0.1714, size=current_batch_size

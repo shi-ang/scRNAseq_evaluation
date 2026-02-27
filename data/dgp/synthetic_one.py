@@ -18,7 +18,7 @@ def synthetic_DGP(
     all_theta=None, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
     control_mu=None, # Control mu parameters, size of total number of genes in the real dataset (>= G)
     pert_mu=None, # Perturbed mu parameters, size of total number of genes in the real dataset (>= G)
-    trial_id_for_rng=None, # Optional for seeding RNG per trial,
+    seed=None, # Optional for seed,
     output_dir=None, # Directory to persist temporary chunked h5ad files
     max_cells_per_chunk=2048,
     normalize=True, # Whether to normalize before log1p for the persisted layer
@@ -33,10 +33,10 @@ def synthetic_DGP(
       - chunk_paths: list[str], h5ad files containing sparse count chunks
       - all_affected_masks: list[np.ndarray], one mask per perturbation
     """
-    if trial_id_for_rng is None:
+    if seed is None:
         rng = np.random.default_rng(42)
     else:
-        rng = np.random.default_rng(trial_id_for_rng)
+        rng = np.random.default_rng(seed)
     
     # --- Parameter Preparation with assertions ---
     # Assert that control_mu, pert_mu, and all_theta are provided
