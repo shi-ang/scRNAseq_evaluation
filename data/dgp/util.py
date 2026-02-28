@@ -75,7 +75,7 @@ def sample_nb_counts(mean, l_c, theta, rng): # theta kept as generic parameter n
 class ChunkedAnnDataWriter:
     """
     Buffer sparse count matrices and persist chunked .h5ad files.
-    Optionally stores per-cell metadata such as cell type in .obs.
+    Optionally stores per-cell metadata such as cell line in .obs.
     """
 
     def __init__(
@@ -99,8 +99,8 @@ class ChunkedAnnDataWriter:
 
         self._buffer_X: list[sparse.csr_matrix] = []
         self._buffer_labels: list[np.ndarray] = []
-        self._buffer_cell_types: list[np.ndarray] = []
-        self._has_cell_type = False
+        self._buffer_cell_lines: list[np.ndarray] = []
+        self._has_cell_line = False
         self._buffer_rows = 0
         self._chunk_idx = 0
         self.chunk_paths: list[str] = []
@@ -109,7 +109,7 @@ class ChunkedAnnDataWriter:
     def buffer_rows(self) -> int:
         return self._buffer_rows
 
-    def append_counts(self, counts_block, perturbation_id: int, cell_type=None) -> None:
+    def append_counts(self, counts_block, perturbation_id: int, cell_line=None) -> None:
         if counts_block.size == 0:
             return
         if sparse.issparse(counts_block):
@@ -118,24 +118,24 @@ class ChunkedAnnDataWriter:
             counts_csr = sparse.csr_matrix(np.asarray(counts_block, dtype=np.int32))
 
         n_rows = counts_csr.shape[0]
-        if cell_type is None:
-            cell_type_arr = np.full(n_rows, -1, dtype=np.int32)
-        elif np.isscalar(cell_type):
-            cell_type_arr = np.full(n_rows, int(cell_type), dtype=np.int32)
-            self._has_cell_type = True
+        if cell_line is None:
+            cell_line_arr = np.full(n_rows, -1, dtype=np.int32)
+        elif np.isscalar(cell_line):
+            cell_line_arr = np.full(n_rows, int(cell_line), dtype=np.int32)
+            self._has_cell_line = True
         else:
-            cell_type_arr = np.asarray(cell_type, dtype=np.int32).reshape(-1)
-            if cell_type_arr.shape[0] != n_rows:
+            cell_line_arr = np.asarray(cell_line, dtype=np.int32).reshape(-1)
+            if cell_line_arr.shape[0] != n_rows:
                 raise ValueError(
-                    f"cell_type must have length {n_rows}, got {cell_type_arr.shape[0]}"
+                    f"cell_line must have length {n_rows}, got {cell_line_arr.shape[0]}"
                 )
-            self._has_cell_type = True
+            self._has_cell_line = True
 
         self._buffer_X.append(counts_csr)
         self._buffer_labels.append(
             np.full(n_rows, perturbation_id, dtype=np.int32)
         )
-        self._buffer_cell_types.append(cell_type_arr)
+        self._buffer_cell_lines.append(cell_line_arr)
         self._buffer_rows += n_rows
 
         if self._buffer_rows >= self.max_cells_per_chunk:
@@ -147,10 +147,10 @@ class ChunkedAnnDataWriter:
 
         chunk_counts = sparse.vstack(self._buffer_X, format="csr", dtype=np.int32)
         chunk_labels = np.concatenate(self._buffer_labels).astype(np.int32, copy=False)
-        chunk_cell_types = np.concatenate(self._buffer_cell_types).astype(np.int32, copy=False)
+        chunk_cell_lines = np.concatenate(self._buffer_cell_lines).astype(np.int32, copy=False)
         obs_dict = {"perturbation": chunk_labels}
-        if self._has_cell_type:
-            obs_dict["cell_type"] = chunk_cell_types
+        if self._has_cell_line:
+            obs_dict["cell_line"] = chunk_cell_lines
         obs = pd.DataFrame(obs_dict, index=[f"cell_{self._chunk_idx}_{i}" for i in range(chunk_counts.shape[0])])
         chunk_adata = ad.AnnData(X=chunk_counts, obs=obs, var=self.var)
         chunk_adata.layers["counts"] = chunk_counts.copy()
@@ -165,6 +165,6 @@ class ChunkedAnnDataWriter:
 
         self._buffer_X.clear()
         self._buffer_labels.clear()
-        self._buffer_cell_types.clear()
+        self._buffer_cell_lines.clear()
         self._buffer_rows = 0
         self._chunk_idx += 1

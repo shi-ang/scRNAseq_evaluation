@@ -13,7 +13,7 @@ from metrics.reconstruction.vendi_score import vendi_score
 
 def _plot_umap_for_single_perturbation(
     embedding: np.ndarray,
-    cell_type: np.ndarray,
+    cell_line: np.ndarray,
     perturbation_id: int,
     output_path: Path,
 ) -> None:
@@ -26,7 +26,7 @@ def _plot_umap_for_single_perturbation(
     color_map = {0: "#1f77b4", 1: "#d62728"}
 
     fig, ax = plt.subplots(figsize=(9, 7), dpi=150)
-    point_colors = [color_map.get(int(ct), "#7f7f7f") for ct in cell_type]
+    point_colors = [color_map.get(int(ct), "#7f7f7f") for ct in cell_line]
     ax.scatter(
         embedding[:, 0],
         embedding[:, 1],
@@ -38,11 +38,11 @@ def _plot_umap_for_single_perturbation(
         rasterized=True,
     )
 
-    ax.set_title(f"Synthetic UMAP: perturbation {perturbation_id}, color = cell type")
+    ax.set_title(f"Synthetic UMAP: perturbation {perturbation_id}, color = cell line")
     ax.set_xlabel("UMAP1")
     ax.set_ylabel("UMAP2")
 
-    cell_type_handles = [
+    cell_line_handles = [
         Line2D(
             [0],
             [0],
@@ -51,7 +51,7 @@ def _plot_umap_for_single_perturbation(
             markerfacecolor=color_map[0],
             markeredgecolor="none",
             markersize=8,
-            label="Type A (0)",
+            label="Line A (0)",
         ),
         Line2D(
             [0],
@@ -61,10 +61,10 @@ def _plot_umap_for_single_perturbation(
             markerfacecolor=color_map[1],
             markeredgecolor="none",
             markersize=8,
-            label="Type B (1)",
+            label="Line B (1)",
         ),
     ]
-    ax.legend(handles=cell_type_handles, title="Cell Type", loc="upper right")
+    ax.legend(handles=cell_line_handles, title="Cell Line", loc="upper right")
 
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
@@ -73,7 +73,7 @@ def _plot_umap_for_single_perturbation(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate synthetic causal DGP data and plot UMAP by cell type per perturbation."
+        description="Generate synthetic causal DGP data and plot UMAP by cell line per perturbation."
     )
     parser.add_argument("--output-dir", type=str, default="results/other_plots", help="Directory for generated chunks and UMAP figures.")
     parser.add_argument("--G", type=int, default=150, help="Number of genes.")
@@ -120,7 +120,7 @@ def main() -> None:
 
     adata = ad.concat(adatas, axis=0, join="outer", merge="same", index_unique=None)
 
-    required_obs = {"cell_type", "perturbation"}
+    required_obs = {"cell_line", "perturbation"}
     missing_obs = required_obs.difference(adata.obs.columns)
     if missing_obs:
         raise ValueError(f"Missing required obs columns: {sorted(missing_obs)}")
@@ -140,14 +140,14 @@ def main() -> None:
     )
     embedding = reducer.fit_transform(X)
 
-    cell_type = adata.obs["cell_type"].to_numpy(dtype=np.int32, copy=False)
+    cell_line = adata.obs["cell_line"].to_numpy(dtype=np.int32, copy=False)
     perturbation = adata.obs["perturbation"].to_numpy(dtype=np.int32, copy=False)
     control_idx = perturbation == -1
     if np.any(control_idx):
-        control_fig_path = output_dir / "umap_cell_type_control.png"
+        control_fig_path = output_dir / "umap_cell_line_control.png"
         _plot_umap_for_single_perturbation(
             embedding=embedding[control_idx],
-            cell_type=cell_type[control_idx],
+            cell_line=cell_line[control_idx],
             perturbation_id=-1,
             output_path=control_fig_path,
         )
@@ -163,10 +163,10 @@ def main() -> None:
 
     for p in perturbation_values:
         idx = perturbation == int(p)
-        fig_path = output_dir / f"umap_cell_type_perturbation_{int(p):02d}.png"
+        fig_path = output_dir / f"umap_cell_line_perturbation_{int(p):02d}.png"
         _plot_umap_for_single_perturbation(
             embedding=embedding[idx],
-            cell_type=cell_type[idx],
+            cell_line=cell_line[idx],
             perturbation_id=int(p),
             output_path=fig_path,
         )

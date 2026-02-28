@@ -7,6 +7,10 @@ This describes the structure produced by [`synthetic_two.py`](/home/shiang/proje
 `synthetic_causalDGP(...)` returns:
 
 - `chunk_paths: list[str]`
+- `affected_masks_pair: list[list[np.ndarray]]`, length 2:
+  - `affected_masks_pair[0]`: affected-gene masks for `A`
+  - `affected_masks_pair[1]`: affected-gene masks for `A_alter`
+  - each inner list has length `P`, each mask is boolean with shape `(G,)`
 
 Written chunk files follow:
 
@@ -36,6 +40,7 @@ Resulting size:
 import anndata as ad
 from anndata.experimental import AnnCollection
 
+chunk_paths, affected_masks_pair = synthetic_causalDGP(...)
 backed_chunks = [ad.read_h5ad(path, backed="r") for path in chunk_paths]
 ac = AnnCollection(
     backed_chunks,
@@ -49,10 +54,10 @@ ac = AnnCollection(
 Collection-level schema:
 
 - `ac.shape = (N0 + P*Nk, G)`
-- `ac.obs` columns: `["perturbation", "cell_type", "chunk_id"]`
+- `ac.obs` columns: `["perturbation", "cell_line", "chunk_id"]`
 - `ac.var_names`: `gene_0 ... gene_{G-1}`
 - `ac.attrs_keys`:
-  - `obs`: `["perturbation", "cell_type", "chunk_id"]`
+  - `obs`: `["perturbation", "cell_line", "chunk_id"]`
   - `layers`: `["counts", "normalized_log1p"]` (layer key configurable)
   - `obsm`: `[]`
 
@@ -60,7 +65,8 @@ Notes:
 
 - Control cells are labeled `perturbation = -1`.
 - Perturbation groups are `0 ... P-1`.
-- `cell_type` is synthetic binary context (`0` or `1`) sampled per cell.
+- `cell_line` is synthetic binary context (`0` or `1`) sampled per cell.
+- The returned affected-gene masks are computed from nonzero entries in `A^{-1} c_q` and `A_alter^{-1} c_q`.
 
 ## Per-chunk `AnnData` schema (`ad.read_h5ad(..., backed="r")`)
 
@@ -80,7 +86,7 @@ Notes:
 `adata.obs`:
 
 - `perturbation` (`int32`)
-- `cell_type` (`int32`)
+- `cell_line` (`int32`)
 
 `adata.var`:
 
@@ -102,6 +108,6 @@ For `sample = ac[idx].to_adata()`:
 
 - `sample.X`: in-memory `csr_matrix` (`int32`)
 - `sample.layers`: `["counts", "normalized_log1p"]`
-- `sample.obs`: includes `perturbation`, `cell_type`, and `chunk_id`
+- `sample.obs`: includes `perturbation`, `cell_line`, and `chunk_id`
 - `sample.var`: shape `(G, 0)` (only index preserved)
 - `sample.uns`: empty

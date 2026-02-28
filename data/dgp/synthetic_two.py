@@ -356,11 +356,12 @@ def synthetic_causalDGP(
     Outputs chunked .h5ad files:
       - .X: raw counts (CSR, int32)
       - .layers[normalized_layer_key]: normalized/log1p (CSR, float32) if normalize=True
-      - .obs["cell_type"]: Bernoulli cell type labels (0/1)
+      - .obs["cell_line"]: Bernoulli cell-line labels (0/1)
 
     Returns:
       - chunk_paths: list[str], h5ad files containing sparse count chunks
-      - all_affected_masks: list[np.ndarray], one mask per perturbation indicating which genes are affected
+      - all_affected_masks: list[list[np.ndarray]], two lists of boolean masks (one per perturbation) 
+      for A and A_alter that indicate which genes are affected by each perturbation.
     """
     rng = np.random.default_rng(42 if seed is None else seed)
 
@@ -424,9 +425,12 @@ def synthetic_causalDGP(
     # Find the non-zero entries in A^-1 * c_q[p] to determine which genes are affected by each perturbation.
     # We can use the sparse linear solver to compute A^-1 @ c_q[p]
     all_affected_masks = []
+    all_affected_masks_alter = []
     for p in range(P):
         effect = spla.spsolve(A, c_q[p])
         all_affected_masks.append(np.abs(effect) > 1e-6)
+        effect_alter = spla.spsolve(A_alter, c_q[p])
+        all_affected_masks_alter.append(np.abs(effect_alter) > 1e-6)
 
     if visualize:
         # Build stacked matrices [A^T; b] and [A_alter^T; b_alter],
@@ -451,8 +455,8 @@ def synthetic_causalDGP(
         im0 = axes[0].imshow(Ab, cmap=cmap_1, vmin=vmin, vmax=vmax, aspect="auto", interpolation="nearest")
         im1 = axes[1].imshow(Ab_alter, cmap=cmap_1, vmin=vmin, vmax=vmax, aspect="auto", interpolation="nearest")
 
-        axes[0].set_title(r"$[A^\top; b]$ (cell type 0)")
-        axes[1].set_title(r"$[A_{\text{alter}}^\top; b_{\text{alter}}]$ (cell type 1)")
+        axes[0].set_title(r"$[A^\top; b]$ (cell line 0)")
+        axes[1].set_title(r"$[A_{\text{alter}}^\top; b_{\text{alter}}]$ (cell line 1)")
         for ax in axes:
             ax.set_xlabel("Genes (downstream)")
             ax.set_ylabel("Bias + Genes (upstream)")
@@ -503,7 +507,7 @@ def synthetic_causalDGP(
         print(f"Saved perturbation shift heatmap visualization to: {cq_out_path}")
 
 
-    # Store bc vectors for each cell type as (b_type + c_q).
+    # Store bc vectors for each cell line as (b_type + c_q).
     # Index 0 corresponds to control bc (q=-1), then perturbations q=0..P-1.
     bc_list: list[list[np.ndarray]] = [
         _build_bc_vectors(bias=b, c_q=c_q) for b in b_list
@@ -532,8 +536,8 @@ def synthetic_causalDGP(
         chains = min(chains_default, n_cells, max_cells_per_chunk)
         samplers = [
             EMSampler(
-                A=A_list[cell_type], 
-                bc=bc_list[cell_type][bc_index], 
+                A=A_list[cell_line_id], 
+                bc=bc_list[cell_line_id][bc_index], 
                 rng=rng,
                 dt=dt, 
                 sigma=math.sqrt(2.0),
@@ -542,7 +546,7 @@ def synthetic_causalDGP(
                 chains=chains,
                 dtype=np.float32,
             )
-            for cell_type in (0, 1)
+            for cell_line_id in (0, 1)
         ]
 
         remaining = n_cells
@@ -554,14 +558,14 @@ def synthetic_causalDGP(
                 continue
 
             current_batch_size = min(remaining, space)
-            cell_type_batch = rng.binomial(1, 0.5, size=current_batch_size).astype(np.int32, copy=False)
+            cell_line_batch = rng.binomial(1, 0.5, size=current_batch_size).astype(np.int32, copy=False)
             x_batch = np.empty((current_batch_size, G), dtype=np.float32)
-            idx_type0 = np.flatnonzero(cell_type_batch == 0)
-            idx_type1 = np.flatnonzero(cell_type_batch == 1)
-            if idx_type0.size > 0:
-                x_batch[idx_type0] = samplers[0].draw(int(idx_type0.size))
-            if idx_type1.size > 0:
-                x_batch[idx_type1] = samplers[1].draw(int(idx_type1.size))
+            idx_line0 = np.flatnonzero(cell_line_batch == 0)
+            idx_line1 = np.flatnonzero(cell_line_batch == 1)
+            if idx_line0.size > 0:
+                x_batch[idx_line0] = samplers[0].draw(int(idx_line0.size))
+            if idx_line1.size > 0:
+                x_batch[idx_line1] = samplers[1].draw(int(idx_line1.size))
 
             # Softplus and normalize mu per cell (rows) so each cell has unit total mean.
             # NOTE: axis=1 is required here; axis=0 can collapse structure across cells.
@@ -579,9 +583,9 @@ def synthetic_causalDGP(
                 mean=mu_batch, l_c=lib_size_pert, theta=local_all_theta, rng=rng
             )
 
-            writer.append_counts(counts, perturbation_id=perturbation_id, cell_type=cell_type_batch)
+            writer.append_counts(counts, perturbation_id=perturbation_id, cell_line=cell_line_batch)
             remaining -= current_batch_size
 
     # flush tail
     writer.flush()
-    return writer.chunk_paths, all_affected_masks
+    return writer.chunk_paths, [all_affected_masks, all_affected_masks_alter]
