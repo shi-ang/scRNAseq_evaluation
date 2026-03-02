@@ -83,7 +83,7 @@ def synthetic_DGP(
         control_counts = sample_nb_counts(
             mean=local_control_mu, l_c=lib_size_control, theta=local_all_theta, rng=rng
         )
-        writer.append_counts(control_counts, perturbation_id=-1)
+        writer.append_counts(control_counts, perturbation_id=-1, cell_line=0)
         control_cells_remaining -= current_batch_size
 
     # Define global perturbation bias, this is the terms in brackets for eq 2 in the paper
@@ -110,7 +110,7 @@ def synthetic_DGP(
             pert_counts = sample_nb_counts(
                 mean=mu_k_loop, l_c=lib_size_pert, theta=local_all_theta, rng=rng
             )
-            writer.append_counts(pert_counts, perturbation_id=perturbation_id)
+            writer.append_counts(pert_counts, perturbation_id=perturbation_id, cell_line=0)
             remaining -= current_batch_size
 
     writer.flush()

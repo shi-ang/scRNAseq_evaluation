@@ -18,7 +18,7 @@ class ScviPerturbation:
         data: anndata.AnnData | anndata.experimental.AnnCollection,
         counts_layer: Optional[str] = None,
         perturbation_key: str = "perturbation",
-        cell_type_key: str = "cell_type",
+        cell_line_key: str = "cell_line",
         batch_key: Optional[str] = None,
         train_idx: Optional[np.ndarray] = None,
         val_idx: Optional[np.ndarray] = None,
@@ -28,7 +28,7 @@ class ScviPerturbation:
         self.data = self._adapt_data(data)
         self.counts_layer = counts_layer
         self.perturbation_key = perturbation_key
-        self.cell_type_key = cell_type_key
+        self.cell_line_key = cell_line_key
         self.batch_key = batch_key
         self.seed = seed
 
@@ -91,7 +91,7 @@ class ScviPerturbation:
         normalized_target_sum: float = 1e4,
     ) -> anndata.AnnData:
         setup_kwargs: dict[str, object] = {
-            "categorical_covariate_keys": [self.perturbation_key],
+            "categorical_covariate_keys": [self.perturbation_key, self.cell_line_key],
         }
         if self.counts_layer is not None:
             setup_kwargs["layer"] = self.counts_layer
