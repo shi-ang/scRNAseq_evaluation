@@ -12,11 +12,12 @@ import pandas as pd
 import scanpy as sc
 from scipy import sparse
 
+from analyses.context_splitter import ContextSplitter
 from analyses.evaluator import evaluation, get_eval_perturbation_ids
 from analyses.synthetic_simulations.util import get_pseudobulks_and_degs
 from models.linear import PseudoPCALinear
 from models.scvi_pert import ScviPerturbation
-from util.anndata_util import get_matrix
+from util.anndata_util import get_matrix, AnnDataProxy
 
 _MODELS = ["Control", "Average", "linearPCA", "scVI"]
 _NORM_LAYER_KEY = "normalized_log1p"
@@ -27,25 +28,6 @@ def _to_vector(x: Any) -> np.ndarray:
     if arr.ndim > 1:
         arr = arr.ravel()
     return arr
-
-
-def _normalize_split_fractions(
-    train_frac: float,
-    val_frac: float,
-    test_frac: float,
-) -> tuple[float, float, float]:
-    fractions = np.asarray([train_frac, val_frac, test_frac], dtype=np.float64)
-    if np.any(fractions < 0):
-        raise ValueError("train_frac, val_frac, and test_frac must be non-negative.")
-
-    total = float(fractions.sum())
-    if total <= 0:
-        raise ValueError("At least one split fraction must be > 0.")
-
-    fractions = fractions / total
-    if fractions[0] <= 0 or fractions[2] <= 0:
-        raise ValueError("train_frac and test_frac must be > 0 after normalization.")
-    return float(fractions[0]), float(fractions[1]), float(fractions[2])
 
 
 def _encode_perturbations(
@@ -111,16 +93,16 @@ def _ensure_normalized_log1p_layer(
 def load_real_dataset(
     dataset_path: str,
     perturbation_key: str,
-    cell_type_key: str,
+    cell_line_key: str,
     control_label: str,
 ) -> tuple[ad.AnnData, dict[str, int]]:
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
     adata = ad.read_h5ad(dataset_path)
-    if cell_type_key not in adata.obs.columns:
+    if cell_line_key not in adata.obs.columns:
         raise KeyError(
-            f"Missing obs column '{cell_type_key}'. Available columns: {list(adata.obs.columns)}"
+            f"Missing obs column '{cell_line_key}'. Available columns: {list(adata.obs.columns)}"
         )
 
     adata, label_mapping = _encode_perturbations(
@@ -129,149 +111,6 @@ def load_real_dataset(
         control_label=control_label,
     )
     return adata, label_mapping
-
-
-def _sample_partitioned_perturbations(
-    perturbations: np.ndarray,
-    test_frac: float,
-    val_within_remaining_frac: float,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    perturbations = np.asarray(perturbations, dtype=np.int32)
-    perturbations = np.unique(perturbations)
-
-    n_perts = int(perturbations.size)
-    if n_perts < 2:
-        raise ValueError(
-            "Each cell type must have at least 2 non-control perturbations for train/test splitting."
-        )
-
-    n_test = int(np.floor(test_frac * n_perts))
-    if test_frac > 0 and n_test == 0:
-        n_test = 1
-    n_test = min(n_test, n_perts - 1)
-
-    test_perts = (
-        rng.choice(perturbations, size=n_test, replace=False)
-        if n_test > 0
-        else np.array([], dtype=np.int32)
-    )
-
-    remaining = perturbations[~np.isin(perturbations, test_perts)]
-    if remaining.size == 0:
-        raise ValueError("No perturbations left for train/val after test split.")
-
-    n_remaining = int(remaining.size)
-    if val_within_remaining_frac <= 0 or n_remaining <= 1:
-        val_perts = np.array([], dtype=np.int32)
-    else:
-        n_val = int(np.floor(val_within_remaining_frac * n_remaining))
-        if n_val == 0:
-            n_val = 1
-        n_val = min(n_val, n_remaining - 1)
-        val_perts = (
-            rng.choice(remaining, size=n_val, replace=False)
-            if n_val > 0
-            else np.array([], dtype=np.int32)
-        )
-
-    train_perts = remaining[~np.isin(remaining, val_perts)]
-    if train_perts.size == 0:
-        raise ValueError("No train perturbations left after val split.")
-
-    return np.sort(train_perts), np.sort(val_perts), np.sort(test_perts)
-
-
-def split_by_cell_type_perturbation(
-    adata: ad.AnnData,
-    cell_type_key: str,
-    train_frac: float,
-    val_frac: float,
-    test_frac: float,
-    trial_seed: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    train_frac, val_frac, test_frac = _normalize_split_fractions(train_frac, val_frac, test_frac)
-    non_test_mass = train_frac + val_frac
-    val_within_remaining = (val_frac / non_test_mass) if non_test_mass > 0 else 0.0
-
-    obs_perturbation = adata.obs["perturbation"].to_numpy(dtype=np.int32, copy=False)
-    obs_cell_type = adata.obs[cell_type_key].astype(str).to_numpy(copy=False)
-
-    control_mask = obs_perturbation == -1
-    control_indices = np.flatnonzero(control_mask)
-
-    rng = np.random.default_rng(int(trial_seed))
-
-    train_parts: list[np.ndarray] = [control_indices]
-    val_parts: list[np.ndarray] = []
-    test_parts: list[np.ndarray] = []
-
-    split_report: dict[str, dict[str, int]] = {}
-    for cell_type in np.unique(obs_cell_type):
-        ct_mask = obs_cell_type == cell_type
-        ct_non_control_perts = np.unique(obs_perturbation[ct_mask & (~control_mask)])
-
-        if ct_non_control_perts.size == 0:
-            split_report[str(cell_type)] = {"n_train_perts": 0, "n_val_perts": 0, "n_test_perts": 0}
-            continue
-
-        train_perts, val_perts, test_perts = _sample_partitioned_perturbations(
-            perturbations=ct_non_control_perts,
-            test_frac=test_frac,
-            val_within_remaining_frac=val_within_remaining,
-            rng=rng,
-        )
-
-        ct_indices = np.flatnonzero(ct_mask)
-        ct_labels = obs_perturbation[ct_indices]
-
-        train_parts.append(ct_indices[np.isin(ct_labels, train_perts)])
-        if val_perts.size > 0:
-            val_parts.append(ct_indices[np.isin(ct_labels, val_perts)])
-        if test_perts.size > 0:
-            test_parts.append(ct_indices[np.isin(ct_labels, test_perts)])
-
-        split_report[str(cell_type)] = {
-            "n_train_perts": int(train_perts.size),
-            "n_val_perts": int(val_perts.size),
-            "n_test_perts": int(test_perts.size),
-        }
-
-    train_idx = np.unique(np.concatenate(train_parts)) if train_parts else np.array([], dtype=int)
-    val_idx = np.unique(np.concatenate(val_parts)) if val_parts else np.array([], dtype=int)
-    test_idx = np.unique(np.concatenate(test_parts)) if test_parts else np.array([], dtype=int)
-
-    if test_idx.size == 0:
-        raise ValueError("Test split is empty. Adjust split fractions or dataset filtering.")
-
-    if np.intersect1d(train_idx, val_idx).size > 0:
-        raise RuntimeError("Train and val splits overlap.")
-    if np.intersect1d(train_idx, test_idx).size > 0:
-        raise RuntimeError("Train and test splits overlap.")
-    if np.intersect1d(val_idx, test_idx).size > 0:
-        raise RuntimeError("Val and test splits overlap.")
-
-    non_control_idx = np.flatnonzero(~control_mask)
-    assigned_non_control = np.unique(np.concatenate([train_idx, val_idx, test_idx]))
-    assigned_non_control = np.intersect1d(assigned_non_control, non_control_idx)
-    if assigned_non_control.size != non_control_idx.size:
-        missing = np.setdiff1d(non_control_idx, assigned_non_control)
-        raise RuntimeError(f"Not all non-control cells were assigned to a split. Missing={missing.size}")
-
-    if np.any(obs_perturbation[val_idx] == -1) or np.any(obs_perturbation[test_idx] == -1):
-        raise RuntimeError("Control cells must stay in train split.")
-
-    split_meta = {
-        "n_train_cells": int(train_idx.size),
-        "n_val_cells": int(val_idx.size),
-        "n_test_cells": int(test_idx.size),
-        "n_train_perts": int(np.unique(obs_perturbation[train_idx][obs_perturbation[train_idx] != -1]).size),
-        "n_val_perts": int(np.unique(obs_perturbation[val_idx][obs_perturbation[val_idx] != -1]).size),
-        "n_test_perts": int(np.unique(obs_perturbation[test_idx][obs_perturbation[test_idx] != -1]).size),
-        "n_control_train_cells": int(control_indices.size),
-        "cell_type_split_report": str(split_report),
-    }
-    return train_idx, val_idx, test_idx, split_meta
 
 
 def compute_means_by_perturbation(
@@ -369,21 +208,14 @@ def _dataset_sparsity(adata_obj: ad.AnnData) -> float:
 
 def run_one_trial(
     adata: ad.AnnData,
+    splitter: ContextSplitter,
     trial_id: int,
-    trial_seed: int,
-    cell_type_key: str,
+    cell_line_key: str,
     counts_layer: str | None,
     obs_layer: str | None,
     deg_alpha: float,
 ) -> list[dict[str, Any]]:
-    train_idx, val_idx, test_idx, split_meta = split_by_cell_type_perturbation(
-        adata=adata,
-        cell_type_key=cell_type_key,
-        train_frac=0.8,
-        val_frac=0.1,
-        test_frac=0.2,
-        trial_seed=trial_seed,
-    )
+    train_idx, val_idx, test_idx = splitter.split(seed=trial_id)
 
     labels = adata.obs["perturbation"].to_numpy(dtype=np.int32, copy=False)
     control_train_idx = train_idx[labels[train_idx] == -1]
@@ -479,7 +311,7 @@ def run_one_trial(
                     gene_names=adata.var_names.to_numpy(),
                     train_idx=train_idx_linear,
                     test_idx=test_idx_linear,
-                    seed=trial_seed,
+                    seed=trial_id,
                 )
                 mu_pred_valid = linear_model.run()
                 mu_pred[test_valid_mask, :] = mu_pred_valid
@@ -488,11 +320,11 @@ def run_one_trial(
                 data=adata,
                 counts_layer=counts_layer,
                 perturbation_key="perturbation",
-                cell_type_key=cell_type_key,
+                cell_line_key=cell_line_key,
                 train_idx=train_idx,
                 val_idx=val_idx,
                 test_idx=test_idx,
-                seed=trial_seed,
+                seed=trial_id,
             )
             ad_test_pred = scvi_model.run(
                 n_latent=10,
@@ -500,7 +332,7 @@ def run_one_trial(
                 n_layers=3,
                 gene_likelihood="zinb",
                 dispersion="gene",
-                max_epochs=200,
+                max_epochs=800,
                 batch_size=512,
                 early_stopping=bool(val_idx.size > 0),
                 dataloader_num_workers=0,
@@ -523,22 +355,20 @@ def run_one_trial(
             mu_pred=mu_pred,
             mu_control_obs=mu_control_test,
             mu_pool_obs=mu_pool_test,
+            true_DEGs=None, # Unknown for real datasets
             DEGs_stats=degs_test,
             perturbation_ids=test_perturbation_ids,
             model=model,
             layer_obs=obs_layer,
             control_label=-1,
-            use_pca_for_mmd=True,
         )
 
         model_metrics.update(
             {
                 "model": model,
                 "trial_id": int(trial_id),
-                "trial_seed": int(trial_seed),
                 "status": "success",
                 "execution_time": time.time() - start_time,
-                **split_meta,
             }
         )
         trial_results.append(model_metrics)
@@ -551,12 +381,15 @@ def run_real_experiments(
     dataset_path: str,
     output_dir: str,
     n_trials: int,
-    seed: int,
     perturbation_key: str,
-    cell_type_key: str,
+    cell_line_key: str,
     control_label: str,
     counts_layer: str | None,
     obs_layer: str | None,
+    split_strategy: str,
+    train_frac: float,
+    val_frac: float,
+    test_frac: float,
     deg_alpha: float,
     norm_target_sum: float,
 ) -> str:
@@ -569,7 +402,7 @@ def run_real_experiments(
     adata, label_mapping = load_real_dataset(
         dataset_path=dataset_path,
         perturbation_key=perturbation_key,
-        cell_type_key=cell_type_key,
+        cell_line_key=cell_line_key,
         control_label=control_label,
     )
 
@@ -596,11 +429,11 @@ def run_real_experiments(
 
     print(f"Loaded dataset '{dataset_name}' from {dataset_path}")
     print(f"Shape: cells={adata.n_obs}, genes={adata.n_vars}")
-    print(f"Cell types: {adata.obs[cell_type_key].nunique()} unique ({cell_type_key})")
+    print(f"Cell lines: {adata.obs[cell_line_key].nunique()} unique ({cell_line_key})")
     print(f"Perturbations (non-control): {len(label_mapping)}")
     print(f"Running {n_trials} trials sequentially (no multiprocessing).")
 
-    n_cell_types = int(adata.obs[cell_type_key].nunique())
+    n_cell_lines = int(adata.obs[cell_line_key].nunique())
     n_total_perturbations = int(len(label_mapping))
     data_sparsity = _dataset_sparsity(adata)
 
@@ -615,22 +448,62 @@ def run_real_experiments(
         "r2_degs",
         "parametric_distance",
         "mmd_distance",
-        "vendi_score", # TODO: change this vendi score
+        "vendi_score_pred",
+        "vendi_score_obs",
         "pds_l1",
         "pds_l2",
         "pds_cosine",
     ]
 
+    # Prepare splitter
+    data_proxy = AnnDataProxy(adata.obs)
+    if dataset_name == "norman19":
+        # Can only do in-context split
+        context_mode = None
+        donor_key = "donor"
+        holdout_context_values = None
+    elif dataset_name == "replogle22":
+        if split_strategy == "in-context":
+            context_mode = None
+            holdout_context_values = None
+        elif split_strategy == "cross-context":
+            context_mode = "cell"
+            holdout_context_values = ["K562"]
+        else:
+            raise ValueError(f"Invalid split_strategy: {split_strategy}")
+    elif dataset_name == "CD4+":
+        if split_strategy == "in-context":
+            context_mode = None
+            holdout_context_values = None
+        elif split_strategy == "cross-context":
+            context_mode = "donor"
+            holdout_context_values = ["D3", "D4"]
+        else:
+            raise ValueError(f"Invalid split_strategy: {split_strategy}")
+    else:
+        raise ValueError(f"Unsupported dataset_name: {dataset_name}")
+    splitter = ContextSplitter(
+        adata=data_proxy,
+        train_frac=train_frac,
+        val_frac=val_frac,
+        test_frac=test_frac,
+        context_mode=context_mode,
+        perturbation_key=perturbation_key,
+        cell_line_key=cell_line_key,
+        donor_key="donor",
+        holdout_context_values=holdout_context_values,
+        control_label=-1,
+    )
+
     all_rows: list[dict[str, Any]] = []
     for trial_id in range(int(n_trials)):
-        trial_seed = int(seed) + int(trial_id)
-        print(f"Trial {trial_id + 1}/{n_trials} (seed={trial_seed})")
+        print(f"Trial {trial_id + 1}/{n_trials})")
         try:
             trial_rows = run_one_trial(
                 adata=adata,
+                splitter=splitter,
                 trial_id=trial_id,
-                trial_seed=trial_seed,
-                cell_type_key=cell_type_key,
+                cell_line_key=cell_line_key,
                 counts_layer=counts_layer,
                 obs_layer=obs_layer,
                 deg_alpha=deg_alpha,
@@ -643,7 +516,7 @@ def run_real_experiments(
                         "deg_alpha": deg_alpha,
                         "n_cells": int(adata.n_obs),
                         "n_genes": int(adata.n_vars),
-                        "n_cell_types": n_cell_types,
+                        "n_cell_lines": n_cell_lines,
                         "n_total_perturbations": n_total_perturbations,
                         "sparsity": data_sparsity,
                     }
@@ -654,13 +527,12 @@ def run_real_experiments(
                 "dataset": dataset_name,
                 "dataset_path": dataset_path,
                 "trial_id": int(trial_id),
-                "trial_seed": int(trial_seed),
                 "status": "failed",
                 "error": str(exc),
                 "deg_alpha": deg_alpha,
                 "n_cells": int(adata.n_obs),
                 "n_genes": int(adata.n_vars),
-                "n_cell_types": n_cell_types,
+                "n_cell_lines": n_cell_lines,
                 "n_total_perturbations": n_total_perturbations,
                 "sparsity": data_sparsity,
                 "execution_time": np.nan,
@@ -706,16 +578,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_path", type=str, default="data/norman19/norman19_processed.h5ad")
     parser.add_argument("--output_dir", type=str, default="results/real_experiments")
     parser.add_argument("--n_trials", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--perturbation_key", type=str, default="perturbation")
-    parser.add_argument("--cell_type_key", type=str, default="cell_type")
+    parser.add_argument("--cell_line_key", type=str, default="cell_line")
     parser.add_argument("--control_label", type=str, default="control")
 
-    parser.add_argument("--counts_layer", type=str, default="counts")
-    parser.add_argument("--obs_layer", type=str, default=_NORM_LAYER_KEY)
-    parser.add_argument("--norm_target_sum", type=float, default=1e4)
+    parser.add_argument("--counts_layer", type=str, default="counts", help=f"Layer containing raw counts for scVI. Set to 'none' to use adata.X as counts.")
+    parser.add_argument("--obs_layer", type=str, default=_NORM_LAYER_KEY, help=f"Layer to use for evaluation and modeling.")
+    parser.add_argument("--norm_target_sum", type=float, default=1e4, help="Target sum for normalization when obs_layer is missing and needs to be computed from counts.")
 
+    parser.add_argument("--split_strategy", type=str, default="in-context", choices=["in-context", "cross-context"])
     parser.add_argument("--train_frac", type=float, default=0.6)
     parser.add_argument("--val_frac", type=float, default=0.2)
     parser.add_argument("--test_frac", type=float, default=0.2)
@@ -734,13 +606,16 @@ def main() -> None:
         dataset_path=args.dataset_path,
         output_dir=args.output_dir,
         n_trials=int(args.n_trials),
-        seed=int(args.seed),
         perturbation_key=args.perturbation_key,
-        cell_type_key=args.cell_type_key,
+        cell_line_key=args.cell_line_key,
         control_label=args.control_label,
         counts_layer=counts_layer,
         obs_layer=obs_layer,
-        deg_alpha=float(args.deg_alpha),
+        split_strategy=args.split_strategy,
+        train_frac=args.train_frac,
+        val_frac=args.val_frac,
+        test_frac=args.test_frac,
+        deg_alpha=args.deg_alpha,
         norm_target_sum=float(args.norm_target_sum),
     )
 

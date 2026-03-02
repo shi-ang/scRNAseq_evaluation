@@ -1,12 +1,10 @@
 from __future__ import annotations
-from typing import Tuple
 from scipy import sparse
 from scipy import stats
 import numpy as np
 import scanpy as sc
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
-from anndata.experimental import AnnCollection
 
 from util.anndata_util import get_matrix
 
@@ -60,131 +58,6 @@ def sum_and_sumsq(matrix):
     gene_sum = dense_matrix.sum(axis=0, dtype=np.float64)
     gene_sumsq = np.square(dense_matrix, dtype=np.float64).sum(axis=0, dtype=np.float64)
     return gene_sum, gene_sumsq
-
-
-def stratified_split_ac(
-    ac: AnnCollection,
-    obs_key: str = "perturbation",
-    train_frac: float = 0.8,
-    val_frac: float = 0.1,
-    test_frac: float = 0.1,
-    seed: int = 0,
-    shuffle_within_split: bool = True,
-) -> Tuple[list[int], list[int], list[int]]:
-    """
-    Stratified random split of an AnnCollection into train/val/test.
-
-    Splits are at the cell level and stratified by ac.obs[obs_key].
-        - Uses only .obs to decide the split; does not touch X.
-        - Subsetting an AnnCollection returns an AnnCollectionView.
-        - For very small strata, it will prioritize putting at least 1 cell into train
-          (and at least 1 into val/test when feasible), while keeping counts consistent.
-
-    Arguments:
-        ac: AnnCollection to split
-        obs_key: Key in ac.obs to use for stratification
-        train_frac: Fraction of data to use for training split
-        val_frac: Fraction of data to use for validation split
-        test_frac: Fraction of data to use for test split
-        seed: Random seed for reproducibility
-        shuffle_within_split: Whether to shuffle indices within each split
-    Returns:
-        idx tuples for train, val, test splits as np.ndarray of ints
-    """
-    fracs = np.array([train_frac, val_frac, test_frac], dtype=np.float64)
-    if np.any(fracs < 0):
-        raise ValueError("train/val/test fractions must be non-negative.")
-    s = fracs.sum()
-    fracs = fracs / s
-    train_frac, val_frac, test_frac = fracs.tolist()
-
-    # Pull labels (only obs; should be computationally cheap even for backed datasets)
-    try:
-        y = np.asarray(ac.obs[obs_key])
-    except Exception as e:
-        # Fallback: try to read from underlying adatas if exposed
-        adatas = getattr(ac, "adatas", None)
-        if adatas is None:
-            raise KeyError(
-                f"Could not access ac.obs['{obs_key}'], and AnnCollection has no .adatas fallback."
-            ) from e
-        y = np.concatenate([np.asarray(a.obs[obs_key]) for a in adatas], axis=0)
-
-    n = y.shape[0]
-    if n == 0:
-        raise ValueError("AnnCollection has 0 observations.")
-
-    rng = np.random.default_rng(seed)
-
-    train_idx: list[int] = []
-    val_idx: list[int] = []
-    test_idx: list[int] = []
-
-    # get unique labels and their indices, then split each label's indices according to the fractions
-    unique_labels = np.unique(y)
-
-    for lab in unique_labels:
-        idx = np.flatnonzero(y == lab)
-        rng.shuffle(idx)
-        m = idx.size
-        if m == 0:
-            continue
-
-        # Base allocation
-        n_train = int(np.floor(train_frac * m))
-        n_val = int(np.floor(val_frac * m))
-        n_test = m - n_train - n_val
-
-        # Heuristics to avoid empty train when possible
-        if m >= 1 and n_train == 0 and train_frac > 0:
-            n_train = 1
-            # take from the larger of val/test if needed
-            if n_val > 0:
-                n_val -= 1
-            elif n_test > 0:
-                n_test -= 1
-
-        # If val requested, try to ensure val has 1 when feasible (m>=2)
-        if val_frac > 0 and m >= 2 and n_val == 0:
-            n_val = 1
-            if n_test > 0:
-                n_test -= 1
-            elif n_train > 1:
-                n_train -= 1
-
-        # If test requested, try to ensure test has 1 when feasible (m>=3)
-        if test_frac > 0 and m >= 3 and n_test == 0:
-            n_test = 1
-            # take from the largest bucket among train/val (keeping train>=1)
-            if n_train > n_val and n_train > 1:
-                n_train -= 1
-            elif n_val > 1:
-                n_val -= 1
-            elif n_train > 1:
-                n_train -= 1
-            else:
-                # can't satisfy perfectly for this small stratum; revert
-                n_test = 0
-
-        # Final safety: make sure counts sum and are non-negative
-        if n_train < 0 or n_val < 0 or n_test < 0 or (n_train + n_val + n_test) != m:
-            # Reset to simplest valid split: everything to train for this label
-            n_train, n_val, n_test = m, 0, 0
-
-        train_idx += idx[:n_train].tolist()
-        val_idx += idx[n_train:n_train + n_val].tolist()
-        test_idx += idx[n_train + n_val:].tolist()
-
-    train_idx = np.asarray(train_idx, dtype=int)
-    val_idx = np.asarray(val_idx, dtype=int)
-    test_idx = np.asarray(test_idx, dtype=int)
-
-    if shuffle_within_split:
-        rng.shuffle(train_idx)
-        rng.shuffle(val_idx)
-        rng.shuffle(test_idx)
-
-    return train_idx, val_idx, test_idx,
 
 
 def _fdr_bh(pvals: np.ndarray) -> np.ndarray:

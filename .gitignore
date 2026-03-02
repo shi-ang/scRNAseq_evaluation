@@ -19,3 +19,5 @@ data/save
 logs/*
 *.sh
 results/*
+test.md
+*.json

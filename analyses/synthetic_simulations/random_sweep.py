@@ -12,11 +12,13 @@ from scipy import sparse
 import anndata as ad
 from anndata.experimental import AnnCollection
 
-from .util import est_cost, systematic_variation, intra_correlation, sum_and_sumsq, stratified_split_ac, get_pseudobulks_and_degs
+from .util import est_cost, systematic_variation, intra_correlation, sum_and_sumsq, get_pseudobulks_and_degs
 from analyses.evaluator import evaluation, get_eval_perturbation_ids
+from analyses.context_splitter import ContextSplitter
 from metrics.reconstruction.vendi_score import vendi_score
 from data.dgp import synthetic_DGP, synthetic_causalDGP
 from models.scvi_pert import ScviPerturbation
+from util.anndata_util import AnnDataProxy
 
 # Set OpenBLAS threads early if it was found to be helpful, otherwise optional
 # os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -64,7 +66,7 @@ def simulate_one_run(
     # The directory and its contents will be deleted after use
     with tempfile.TemporaryDirectory(prefix=f"synthetic_trial_{trial_id_for_rng}_", dir="/tmp") as tmp_dir:
         if dataset_name == "synthetic_one":
-            chunk_paths, _ = synthetic_DGP(
+            chunk_paths, affected_genes = synthetic_DGP(
                 G=G,
                 N0=N0,
                 Nk=Nk,
@@ -97,6 +99,8 @@ def simulate_one_run(
                 normalize=normalize,
                 normalized_layer_key=_NORM_LAYER_KEY,
             )
+            # TODO: for this synthetic data, affected_genes has two parts (each for one of the cell types)
+            affected_genes = None
         else:
             raise ValueError(f"Unsupported dataset_name: {dataset_name}")
         # Memmaps keep large (P x G) accumulators off RAM while still supporting ndarray ops.
@@ -227,15 +231,19 @@ def simulate_one_run(
         }
 
         # Split indices 
-        train_idx, val_idx, test_idx = stratified_split_ac(
-            ac=collection,
-            obs_key="perturbation",
-            train_frac=0.8,
+        proxy = AnnDataProxy(collection.obs)
+        splitter = ContextSplitter(
+            adata=proxy,
+            train_frac=0.7,
             val_frac=0.1,
             test_frac=0.2,
-            seed=trial_id_for_rng,
-            shuffle_within_split=True,
+            context_mode=None,
+            perturbation_key="perturbation",
+            cell_line_key="cell_line",
+            donor_key="donor",
         )
+        train_idx, val_idx, test_idx = splitter.split(seed=trial_id_for_rng)
+
         ac_train_val = collection[np.concatenate([train_idx, val_idx])]
         ac_test = collection[test_idx]
 
@@ -283,7 +291,7 @@ def simulate_one_run(
                     n_layers=3,
                     gene_likelihood="zinb",
                     dispersion="gene",
-                    max_epochs=200,
+                    max_epochs=800,
                     batch_size=512,
                     early_stopping=True,
                     dataloader_num_workers=0,
@@ -298,13 +306,15 @@ def simulate_one_run(
                 mu_obs=mu_obs_test,
                 mu_control_obs=mu_control_test,
                 mu_pool_obs=mu_pool_test,
+                true_DEGs=affected_genes,
                 DEGs_stats=degs_test,
                 perturbation_ids=test_perturbation_ids,
                 model=model,
                 layer_obs=_NORM_LAYER_KEY,
                 control_label=-1,
-                use_pca_for_mmd=True,
             )
+
+            print(model_results)
 
             model_results.update({
                 'model': model,
@@ -326,8 +336,8 @@ def sample_parameters(param_ranges): # Unchanged from original
         elif range_info['type'] == 'log2_seq':
             log_min = int(np.log2(range_info['min']))
             log_max = int(np.log2(range_info['max']))
-            log_value = int(np.random.uniform(log_min, log_max + 1))
-            params[param] = 2 ** log_value
+            log_value = np.random.uniform(log_min, log_max)
+            params[param] = int(2 ** log_value)
         elif range_info['type'] == 'fixed':
             params[param] = range_info['value']
     return params
@@ -374,11 +384,12 @@ def _pool_worker_timed(task_info_dict):
     except Exception as e:
         # Define metrics_error_keys locally for safety
         metrics_error_keys_local = { 
-            'pearson', 'pearson_degs',
-            'mae', 'mae_degs',
-            'mse', 'mse_degs',
-            'r2', 'r2_degs',
-            'parametric_distance', 'mmd_distance', 'vendi_score_test',
+            'pearson', 'pearson_true_degs', 'pearson_degs',
+            'mae', 'mae_true_degs', 'mae_degs',
+            'mse', 'mse_true_degs', 'mse_degs',
+            'r2', 'r2_true_degs', 'r2_degs',
+            'parametric_distance', 'mmd_distance', 
+            'vendi_score_pred', 'vendi_score_obs',
             'pds_l1', 'pds_l2', 'pds_cosine',
             'model', 'execution_time',
             'sparsity', 'median_library_size', 'systematic_variation', 'intra_corr', 'vendi_score',
@@ -467,11 +478,12 @@ def run_random_sweep(
         failed_trials = results_df[results_df['status'] == 'failed']
         # Define metrics_error keys for excluding them from params logging
         metrics_error_keys = { 
-            'pearson', 'pearson_degs',
-            'mae', 'mae_degs',
-            'mse', 'mse_degs',
-            'r2', 'r2_degs',
-            'parametric_distance', 'mmd_distance', 'vendi_score_test',
+            'pearson', 'pearson_true_degs', 'pearson_degs',
+            'mae', 'mae_true_degs', 'mae_degs',
+            'mse', 'mse_true_degs', 'mse_degs',
+            'r2', 'r2_true_degs', 'r2_degs',
+            'parametric_distance', 'mmd_distance', 
+            'vendi_score_pred', 'vendi_score_obs',
             'pds_l1', 'pds_l2', 'pds_cosine',
             'sparsity', 'vendi_score'
         }

@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 from anndata import AnnData
 from anndata.experimental import AnnCollection
 from scipy import sparse
 from sklearn.decomposition import IncrementalPCA
+
+
+class AnnDataProxy:
+    """Minimal AnnData-like proxy exposing `.obs` and `.n_obs`."""
+
+    def __init__(self, obs: pd.DataFrame) -> None:
+        self.obs = obs
+        self.n_obs = int(len(obs))
 
 
 def get_matrix(data_obj, layer_key: str | None):
@@ -200,5 +209,70 @@ def fit_control_incremental_pca(
 
     if not fitted_once:
         raise ValueError("IncrementalPCA failed to fit on control cells.")
+
+    return pca_model
+
+
+def fit_incremental_pca_all_cells(
+    data_obj: AnnData | AnnCollection,
+    layer_key: str | None,
+    n_pca_components: int = 50,
+    batch_size: int = 1024,
+    data_name: str = "data_obj",
+) -> IncrementalPCA:
+    """
+    Fit IncrementalPCA on all cells.
+    """
+    if int(n_pca_components) <= 0:
+        raise ValueError(
+            f"n_pca_components must be a positive integer. Got {n_pca_components}."
+        )
+
+    n_obs = int(data_obj.n_obs)
+    if n_obs <= 0:
+        raise ValueError(f"{data_name} has no observations to fit IncrementalPCA.")
+
+    n_components = min(int(n_pca_components), n_obs, int(data_obj.n_vars))
+    fit_batch_size = int(batch_size)
+    if fit_batch_size < n_components:
+        raise ValueError(
+            f"batch_size ({fit_batch_size}) must be >= n_components "
+            f"({n_components}) for IncrementalPCA partial_fit."
+        )
+
+    pca_model = IncrementalPCA(n_components=n_components, batch_size=fit_batch_size)
+    tail_batch: np.ndarray | None = None
+    fitted_once = False
+
+    for batch_matrix, _ in iterate_batches(
+        data_obj=data_obj,
+        layer_key=layer_key,
+        batch_size=fit_batch_size,
+        obs_key=None,
+    ):
+        all_batch = np.asarray(batch_matrix, dtype=np.float64)
+        if all_batch.shape[0] == 0:
+            continue
+
+        if all_batch.shape[0] < n_components:
+            if tail_batch is None:
+                tail_batch = all_batch
+            else:
+                tail_batch = np.concatenate([tail_batch, all_batch], axis=0)
+            continue
+
+        pca_model.partial_fit(all_batch)
+        fitted_once = True
+
+    if tail_batch is not None and tail_batch.shape[0] > 0:
+        if tail_batch.shape[0] < n_components:
+            pad_needed = n_components - tail_batch.shape[0]
+            pad = tail_batch[np.arange(pad_needed) % tail_batch.shape[0]]
+            tail_batch = np.concatenate([tail_batch, pad], axis=0)
+        pca_model.partial_fit(tail_batch)
+        fitted_once = True
+
+    if not fitted_once:
+        raise ValueError("IncrementalPCA failed to fit on all cells.")
 
     return pca_model
