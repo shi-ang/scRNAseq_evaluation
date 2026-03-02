@@ -1,3 +1,4 @@
+import inspect
 from typing import Optional, Literal
 
 import anndata
@@ -45,6 +46,36 @@ class ScviPerturbation:
         else:
             return CollectionAdapter(data)
 
+    def _get_scvi_normalized_log1p(
+        self,
+        indices: Optional[np.ndarray] = None,
+        target_sum: float = 1e4,
+    ) -> np.ndarray:
+        """
+        Fetch normalized scVI expression and align it to scanpy-like normalized+log1p scale.
+
+        Arguments:
+            model: trained scVI model
+            indices: optional indices to subset the data (e.g. test set)
+            target_sum: target sum for scVI normalized expression (default 1e4)
+        """
+        get_expr_kwargs: dict[str, object] = {}
+        if indices is not None:
+            get_expr_kwargs["indices"] = indices
+
+        # Keep compatibility across scvi-tools versions.
+        signature = inspect.signature(self.model.get_normalized_expression)
+        if "library_size" in signature.parameters:
+            get_expr_kwargs["library_size"] = float(target_sum)
+        if "return_numpy" in signature.parameters:
+            get_expr_kwargs["return_numpy"] = True
+
+        normalized = self.model.get_normalized_expression(**get_expr_kwargs)
+        normalized_arr = np.asarray(normalized, dtype=np.float32)
+        np.log1p(normalized_arr, out=normalized_arr)
+        return normalized_arr
+
+
     def run(
         self,
         n_latent: int = 10,
@@ -57,6 +88,7 @@ class ScviPerturbation:
         early_stopping: bool = False,
         dataloader_num_workers: int = 0,
         dataloader_persistent_workers: Optional[bool] = None,
+        normalized_target_sum: float = 1e4,
     ) -> anndata.AnnData:
         setup_kwargs: dict[str, object] = {
             "categorical_covariate_keys": [self.perturbation_key],
@@ -98,7 +130,10 @@ class ScviPerturbation:
         
         # store results in an annData object
         z = self.model.get_latent_representation(indices=self.test_idx)
-        scvi_normalized = self.model.get_normalized_expression(indices=self.test_idx)
+        scvi_normalized = self._get_scvi_normalized_log1p(
+            indices=self.test_idx,
+            target_sum=float(normalized_target_sum),
+        )
         if isinstance(self.data, CollectionAdapter):
             # IMPORTANT: AnnCollectionView.to_adata() gives X/layers; AnnCollection.to_adata() does not. :contentReference[oaicite:1]{index=1}
             test_view = self.data.collection[self.test_idx, :]   # AnnCollectionView
@@ -108,7 +143,7 @@ class ScviPerturbation:
             adata_out = self.data[self.test_idx].copy()
         
         adata_out.obsm["X_scvi"] = z
-        adata_out.layers["scvi_normalized"] = scvi_normalized.astype("float32", copy=False)
+        adata_out.layers["scvi_normalized"] = scvi_normalized
         return adata_out
 
 
