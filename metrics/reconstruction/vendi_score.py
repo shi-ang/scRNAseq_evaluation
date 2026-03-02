@@ -1,8 +1,16 @@
+from __future__ import annotations
+from typing import Optional
 import numpy as np
 from anndata import AnnData
 from anndata.experimental import AnnCollection
+from sklearn.decomposition import PCA
 
-from util.anndata_util import fit_control_incremental_pca, iterate_batches, obs_has_key
+from util.anndata_util import (
+    fit_control_incremental_pca,
+    fit_incremental_pca_all_cells,
+    iterate_batches,
+    obs_has_key,
+)
 
 
 def _pairwise_squared_distances(x: np.ndarray, y: np.ndarray | None = None) -> np.ndarray:
@@ -83,6 +91,101 @@ def _sample_rows_from_grouped_embeddings(
     return np.concatenate(sampled_parts, axis=0)
 
 
+def vendi_score_pseudobulk(
+    pseudobulk: np.ndarray, # Pseudobulk matrix of shape (n_perturbations + 1, n_features) or (n_perturbations, n_features) where the first row is control
+    control_idx: Optional[int] = None, # Index of the control row in the pseudobulk matrix
+    n_pca_components: int = 50,
+    random_state: int = 0,
+) -> float:
+    """
+    Compute perturbation-level Vendi score using RBF distances.
+
+    Procedure:
+    1) Fit PCA on all pseduobulk rows (perturbations) and transform all pseduobulk prediction
+    2) Build pairwise similarities matrix via RBF kernel K_ij = exp(-||x_i-x_j||_2 / (2 * sigma^2)).
+    3) Normalize matrix as A = K / n_perturbations.
+    4) Eigendecompose A to obtain eigenvalues.
+    5) Compute von Neumann entropy H(A) = -sum_i lambda_i log(lambda_i), with 0log0 = 0.
+    6) Return Vendi score VS = exp(H(A)).
+
+    Arguments:
+    - pseudobulk: Pseudobulk matrix of shape (n_perturbations + 1, n_features) or (n_perturbations, n_features),
+        where it may contain the control row if (control_idx is not None).
+    - control_idx: Index of the control row in the pseudobulk matrix, or None if no control row is present.
+    - n_pca_components: number of PCA components to use for the embedding before distance calculation; default 50 for a balance of expressiveness and stability.
+    - random_state: random seed for reproducibility of PCA; default 0.
+    """
+    X = np.asarray(pseudobulk, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(
+            f"pseudobulk must be a 2D array of shape (n_samples, n_features). Got shape={X.shape}."
+        )
+    if X.shape[0] == 0 or X.shape[1] == 0:
+        return float("nan")
+    if not np.all(np.isfinite(X)):
+        raise ValueError("pseudobulk contains non-finite values (NaN or inf).")
+    if int(n_pca_components) <= 0:
+        raise ValueError(
+            f"n_pca_components must be a positive integer. Got {n_pca_components}."
+        )
+
+    # Remove the control row when it is explicitly present.
+    if control_idx is not None:
+        n_rows = int(X.shape[0])
+        idx = int(control_idx)
+        if idx < 0:
+            idx += n_rows
+        if idx < 0 or idx >= n_rows:
+            raise IndexError(
+                f"control_idx={control_idx} is out of bounds for pseudobulk with {n_rows} rows."
+            )
+        if n_rows <= 1:
+            return float("nan")
+        row_mask = np.ones(n_rows, dtype=bool)
+        row_mask[idx] = False
+        X = X[row_mask, :]
+
+    n_perturbations = int(X.shape[0])
+    if n_perturbations == 0:
+        return float("nan")
+    if n_perturbations == 1:
+        return 1.0
+
+    # Constant pseudobulk rows imply zero pairwise distances (all profiles identical).
+    # In this case, sklearn PCA emits a divide-by-zero warning when computing
+    # explained_variance_ratio_, and the resulting Vendi score should be exactly 1.
+    total_var = float(np.var(X, axis=0, dtype=np.float64).sum())
+    if total_var <= 0.0:
+        return 1.0
+
+    n_components = min(int(n_pca_components), n_perturbations, int(X.shape[1]))
+    if n_components > 0:
+        svd_solver = (
+            "full" if n_components >= min(n_perturbations, int(X.shape[1])) else "randomized"
+        )
+        pca_model = PCA(
+            n_components=n_components,
+            svd_solver=svd_solver,
+            random_state=random_state,
+        )
+        Z = pca_model.fit_transform(X).astype(np.float64, copy=False)
+    else:
+        Z = X
+
+    # RBF bandwidth via median off-diagonal Euclidean distance.
+    dist_sq = _pairwise_squared_distances(Z)
+    tri = np.triu_indices(n_perturbations, k=1)
+    sigma_rbf = _median_positive(np.sqrt(dist_sq[tri], dtype=np.float64))
+
+    # Similarity matrix from pairwise distances.
+    K = np.exp(-dist_sq / (2.0 * sigma_rbf * sigma_rbf), dtype=np.float64)
+    np.fill_diagonal(K, 1.0)
+
+    # Normalize and compute Vendi score from spectrum.
+    A = K / float(n_perturbations)
+    spectrum = np.linalg.eigvalsh(A)
+    return _vendi_from_spectrum(spectrum)
+
 def vendi_score(
     ac: AnnData | AnnCollection,
     ac_batch_size: int = 1024,
@@ -90,14 +193,15 @@ def vendi_score(
     sample_size: int = 2000,
     random_state: int = 0,
     layer_key: str | None = None,
-    control_label: str | int | float = -1,
+    control_label: str | int | float | None = -1,
 ) -> float:
     """
     Compute perturbation-level Vendi score using RBF-MMD distances.
 
     Procedure:
-    1) Fit IncrementalPCA on control cells only (perturbation == control_label).
-    2) Transform all perturbation cells with that same transformation.
+    1) If control_label is not None: fit IncrementalPCA on control cells only
+       (perturbation == control_label), then transform non-control cells.
+    2) If control_label is None: fit IncrementalPCA on all cells, then transform all cells.
     3) Build pairwise perturbation distance matrix via biased MMD^2 (RBF kernel).
     4) Convert distances to similarities K_ij = exp(-MMD^2_ij / (2 * sigma^2)).
     5) Normalize matrix as A = K / n_perturbations.
@@ -112,13 +216,16 @@ def vendi_score(
     - sample_size: number of rows to sample for estimating sigma_rbf and sigma_transform; default 2000 for a balance of speed and stability.
     - random_state: random seed for reproducibility of sampling.
     - layer_key: if provided, use this layer instead of `.X`.
-    - control_label: label in .obs["perturbation"] identifying control cells.
+    - control_label: label in .obs["perturbation"] identifying control cells. If None, no control is excluded.
     """
     if not obs_has_key(getattr(ac, "obs", None), "perturbation"):
         raise KeyError("ac.obs must contain a 'perturbation' column.")
 
     obs_pert = np.asarray(ac.obs["perturbation"])
-    perturbation_ids = np.unique(obs_pert[obs_pert != control_label])
+    if control_label is None:
+        perturbation_ids = np.unique(obs_pert)
+    else:
+        perturbation_ids = np.unique(obs_pert[obs_pert != control_label])
     try:
         perturbation_ids = np.asarray(sorted(perturbation_ids.tolist()), dtype=object)
     except TypeError:
@@ -132,18 +239,26 @@ def vendi_score(
 
     rng = np.random.default_rng(random_state)
 
-    # Step 1: fit IncrementalPCA on control cells only.
-    pca_model = fit_control_incremental_pca(
-        data_obj=ac,
-        layer_key=layer_key,
-        control_label=control_label,
-        n_pca_components=n_pca_components,
-        batch_size=ac_batch_size,
-        obs_key="perturbation",
-        data_name="ac",
-    )
+    # Step 1 and Step 2: fit and apply IncrementalPCA according to control_label behavior.
+    if control_label is None:
+        pca_model = fit_incremental_pca_all_cells(
+            data_obj=ac,
+            layer_key=layer_key,
+            n_pca_components=n_pca_components,
+            batch_size=ac_batch_size,
+            data_name="ac",
+        )
+    else:
+        pca_model = fit_control_incremental_pca(
+            data_obj=ac,
+            layer_key=layer_key,
+            control_label=control_label,
+            n_pca_components=n_pca_components,
+            batch_size=ac_batch_size,
+            obs_key="perturbation",
+            data_name="ac",
+        )
 
-    # Step 2: apply the control-fitted IncrementalPCA model to all perturbation cells.
     # Collect one embedding matrix per perturbation ID.
     pert_embeddings_chunks: dict[object, list[np.ndarray]] = {
         ptb: [] for ptb in perturbation_ids.tolist()
@@ -156,7 +271,10 @@ def vendi_score(
     ):
         if batch_labels is None:
             continue
-        pert_mask = batch_labels != control_label
+        if control_label is None:
+            pert_mask = np.ones(batch_labels.shape[0], dtype=bool)
+        else:
+            pert_mask = batch_labels != control_label
         if not np.any(pert_mask):
             continue
 
@@ -217,8 +335,7 @@ def vendi_score(
     )
     np.fill_diagonal(K, 1.0)
 
-    # Step 5: normalize by number of perturbations.
+    # Normalize and compute Vendi score from spectrum.
     A = K / float(n_perturbations)
-    # Step 6: eigendecomposition of A.
     spectrum = np.linalg.eigvalsh(A)
     return _vendi_from_spectrum(spectrum)     # Step 7 and Step 8 
