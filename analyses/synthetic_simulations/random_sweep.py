@@ -57,11 +57,17 @@ def simulate_one_run(
     normalize: bool=True, # Whether to normalize the data
     max_cells_per_chunk: int=2048, # Count-generation chunk size
     ann_batch_size: int=1024, # AnnCollection batch size for scanpy processing
+    split_strategy: str="in-context", # Data splitting strategy for evaluation
 ):
     """
     Simulate one experiment using chunked AnnData/AnnCollection processing.
     This avoids materializing the full (cells x genes) matrix in memory.
     """
+    if dataset_name == "synthetic_one" and split_strategy == "cross-context":
+        print("Warning: 'cross-context' split strategy is not applicable to 'synthetic_one' dataset." \
+        " Defaulting to 'in-context' split strategy for this dataset.")
+        split_strategy = "in-context"
+
     # Setup temporary directory for chunked data
     # The directory and its contents will be deleted after use
     with tempfile.TemporaryDirectory(prefix=f"synthetic_trial_{trial_id_for_rng}_", dir="/tmp") as tmp_dir:
@@ -237,10 +243,12 @@ def simulate_one_run(
             train_frac=0.7,
             val_frac=0.1,
             test_frac=0.2,
-            context_mode=None,
+            context_mode="cell" if split_strategy == "cross-context" else None,
             perturbation_key="perturbation",
             cell_line_key="cell_line",
             donor_key="donor",
+            holdout_context_values=[1] if split_strategy == "cross-context" else None,
+            control_label=-1,
         )
         train_idx, val_idx, test_idx = splitter.split(seed=trial_id_for_rng)
 
@@ -352,6 +360,7 @@ def _pool_worker_timed(task_info_dict):
     dataset_name = task_info_dict['dataset_name']
     trial_id = task_info_dict['trial_id']
     params_dict = task_info_dict['params_dict']
+    split_strategy = task_info_dict['split_strategy']
     control_mu_from_main = _GLOBAL["control_mu"]
     all_theta_from_main  = _GLOBAL["all_theta"]
     pert_mu_from_main    = _GLOBAL["pert_mu"]
@@ -360,6 +369,7 @@ def _pool_worker_timed(task_info_dict):
     params_for_sim = params_dict.copy() # Avoid modifying original params_dict
     params_for_sim['dataset_name'] = dataset_name
     params_for_sim['trial_id_for_rng'] = trial_id
+    params_for_sim['split_strategy'] = split_strategy
     params_for_sim['control_mu'] = control_mu_from_main
     params_for_sim['all_theta'] = all_theta_from_main
     params_for_sim['pert_mu'] = pert_mu_from_main
@@ -417,6 +427,7 @@ def run_random_sweep(
     use_multiprocessing=True,
     max_cells_per_chunk=2048,
     ann_batch_size=1024,
+    split_strategy="in-context",
 ):
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -438,7 +449,8 @@ def run_random_sweep(
         tasks_for_pool.append({
             'trial_id': i, 
             'dataset_name': dataset_name,
-            'params_dict': params
+            'params_dict': params,
+            'split_strategy': split_strategy,
         })
     # sort tasks by estimated cost in descending order to optimize workload distribution
     tasks_for_pool.sort(key=lambda t: est_cost(t["params_dict"]), reverse=True)
@@ -522,6 +534,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_cells_per_chunk", type=int, default=2048, help="Maximum cells per generated h5ad chunk")
     parser.add_argument("--ann_batch_size", type=int, default=1024, help="Batch size when iterating AnnCollection")
     parser.add_argument("--dataset", type=str, default="synthetic_one", choices=["synthetic_one", "synthetic_two"], help="Dataset to use for the simulation")
+    parser.add_argument("--split_strategy", type=str, default="in-context", choices=["in-context", "cross-context"], help="Data splitting strategy for evaluation, cross-context is only available for synthetic_two")
     args = parser.parse_args()
 
     # Set seed
@@ -556,6 +569,7 @@ if __name__ == "__main__":
         use_multiprocessing=args.multiprocessing,
         max_cells_per_chunk=args.max_cells_per_chunk,
         ann_batch_size=args.ann_batch_size,
+        split_strategy=args.split_strategy,
     ) 
     print("\nDone doing the sweep. Plotting results...")
 
