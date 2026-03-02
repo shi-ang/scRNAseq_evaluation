@@ -35,7 +35,7 @@ When loaded with `anndata`/`scanpy`, the object has:
 - `good_coverage` (`bool`)
 - `number_of_cells` (`int64`)
 - `tissue_type` (`category`)
-- `cell_type` (`category`)
+- `cell_line` (`category`)
 - `cancer` (`bool`)
 - `disease` (`category`)
 - `perturbation_type` (`category`)

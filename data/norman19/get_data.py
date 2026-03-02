@@ -38,7 +38,6 @@ adata.obs.rename(columns = {
     'nCount_RNA': 'ncounts',
     'nFeature_RNA': 'ngenes',
     'percent.mt': 'percent_mito',
-    'cell_line': 'cell_type',
 }, inplace=True)
 adata.obs['perturbation'] = adata.obs['perturbation'].str.replace('_', '+')
 adata.obs['perturbation'] = adata.obs['perturbation'].astype('category')
