@@ -336,7 +336,8 @@ def synthetic_causalDGP(
     mu_l=1.0,   # mean of log library size
     all_theta=None, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
     mask_method: str = "Erdos-Renyi", # Erdos-Renyi or Power-law
-    swap_fraction: float = 0.2,  # row-wise fraction of A edges rewired for A_alter
+    diversity_type: str = "A", # Whether to create diversity by perturbing A or b, three options: "A", "b", "both"
+    swap_fraction: float = 0.8,  # row-wise fraction of A edges rewired for A_alter
     seed=None, # Optional for seeding RNG per trial
     output_dir=None, # Directory to persist temporary chunked h5ad files
     max_cells_per_chunk=2048,
@@ -394,13 +395,24 @@ def synthetic_causalDGP(
     
     # Create a perturbed version of A by swapping X% (swap_fraction) of each row's nonzero edges
     # into zero positions. This preserves row sparsity and weight distribution.
-    A_alter = _swap_matrix(A=A, rng=rng, swap_fraction=swap_fraction)
-
-    A = _shift_causal_matrix(A, target_max_real_eig=-0.5)
-    A_alter = _shift_causal_matrix(A_alter, target_max_real_eig=-0.5)
+    diversity_type = diversity_type.strip().lower()
+    if diversity_type in ("a", "both"):
+        A_alter = _swap_matrix(A=A, rng=rng, swap_fraction=swap_fraction)
+        A = _shift_causal_matrix(A, target_max_real_eig=-0.5)
+        A_alter = _shift_causal_matrix(A_alter, target_max_real_eig=-0.5)
+    elif diversity_type == "b":
+        A = _shift_causal_matrix(A, target_max_real_eig=-0.5)
+        A_alter = A.copy()
+    else:
+        raise ValueError(f"Invalid diversity_type: {diversity_type}. Must be one of 'A', 'b', or 'both'.")
 
     b_base = rng.uniform(-5.0, 5.0, size=G).astype(np.float32)
-    b_base_alt = rng.uniform(-5.0, 5.0, size=G).astype(np.float32)
+    if diversity_type in ("b", "both"):
+        b_base_alt = rng.uniform(-5.0, 5.0, size=G).astype(np.float32)
+    elif diversity_type == "a":
+        b_base_alt = b_base.copy()
+    else:
+        raise ValueError(f"Invalid diversity_type: {diversity_type}. Must be one of 'A', 'b', or 'both'.")
 
     # Randomly reorder genes in A and b 
     perm = rng.permutation(G)
