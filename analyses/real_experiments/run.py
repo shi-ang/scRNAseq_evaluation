@@ -387,9 +387,6 @@ def run_real_experiments(
     counts_layer: str | None,
     obs_layer: str | None,
     split_strategy: str,
-    train_frac: float,
-    val_frac: float,
-    test_frac: float,
     deg_alpha: float,
     norm_target_sum: float,
 ) -> str:
@@ -484,9 +481,9 @@ def run_real_experiments(
         raise ValueError(f"Unsupported dataset_name: {dataset_name}")
     splitter = ContextSplitter(
         adata=data_proxy,
-        train_frac=train_frac,
-        val_frac=val_frac,
-        test_frac=test_frac,
+        train_frac=0.6,
+        val_frac=0.2,
+        test_frac=0.2,
         context_mode=context_mode,
         perturbation_key=perturbation_key,
         cell_line_key=cell_line_key,
@@ -588,9 +585,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--norm_target_sum", type=float, default=1e4, help="Target sum for normalization when obs_layer is missing and needs to be computed from counts.")
 
     parser.add_argument("--split_strategy", type=str, default="in-context", choices=["in-context", "cross-context"])
-    parser.add_argument("--train_frac", type=float, default=0.6)
-    parser.add_argument("--val_frac", type=float, default=0.2)
-    parser.add_argument("--test_frac", type=float, default=0.2)
     parser.add_argument("--deg_alpha", type=float, default=0.05)
     return parser.parse_args()
 
@@ -612,9 +606,6 @@ def main() -> None:
         counts_layer=counts_layer,
         obs_layer=obs_layer,
         split_strategy=args.split_strategy,
-        train_frac=args.train_frac,
-        val_frac=args.val_frac,
-        test_frac=args.test_frac,
         deg_alpha=args.deg_alpha,
         norm_target_sum=float(args.norm_target_sum),
     )
