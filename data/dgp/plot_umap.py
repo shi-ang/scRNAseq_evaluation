@@ -81,6 +81,7 @@ def main() -> None:
     parser.add_argument("--Nk", type=int, default=2048, help="Number of cells per perturbation.")
     parser.add_argument("--P", type=int, default=5, help="Number of perturbations.")
     parser.add_argument("--mu_l", type=float, default=1.0, help="Mean of log library size for the synthetic data.")
+    parser.add_argument("--diversity-type", type=str, default="both", choices=["A", "b", "both"], help="Type of diversity.")
     parser.add_argument("--swap-fraction", type=float, default=0.8, help="Fraction of A edges rewired to create A_alter.")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed.")
     parser.add_argument("--max-cells-per-chunk", type=int, default=1024, help="Chunk size for writing h5ad files.")
@@ -107,6 +108,7 @@ def main() -> None:
         seed=args.seed,
         output_dir=str(output_dir),
         mask_method="power-law",
+        diversity_type=args.diversity_type,
         max_cells_per_chunk=args.max_cells_per_chunk,
         normalize=True,
         normalized_layer_key=args.normalized_layer_key,
