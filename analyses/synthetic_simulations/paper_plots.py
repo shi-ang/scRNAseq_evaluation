@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import numpy as np
 from matplotlib import pyplot as plt
+from matplotlib.patches import Patch
 from scipy import stats
 import seaborn as sns
 import argparse
@@ -17,6 +18,21 @@ PDS_LABELS = {
     'pds_l1': 'PDS (L1)',
     'pds_l2': 'PDS (L2)',
     'pds_cosine': 'PDS (Cosine)',
+}
+
+MODEL_ORDER = ("Control", "Average", "linearPCA", "scVI")
+MODEL_ALIASES = {
+    "control": "Control",
+    "average": "Average",
+    "linearpca": "linearPCA",
+    "linear_pca": "linearPCA",
+    "scvi": "scVI",
+}
+MODEL_COLORS = {
+    "Control": "#4e79a7",
+    "Average": "#f28e2b",
+    "linearPCA": "#59a14f",
+    "scVI": "#e15759",
 }
 
 # Set matplotlib parameters to create professional plots
@@ -64,13 +80,6 @@ plt.rcParams.update({
     'savefig.pad_inches': 0.05
 })
 
-def load_data(file_path):
-    """Load dataset from the specified CSV file."""
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
-        
-    return pd.read_csv(file_path)
-
 def moving_average(x, y, window=10):
     """Calculate moving average of y with respect to sorted x values."""
     # Sort points by x values
@@ -103,18 +112,48 @@ def prepare_xy(x, y):
     mask = np.isfinite(x_arr) & np.isfinite(y_arr)
     return x_arr[mask], y_arr[mask]
 
+def normalize_model_name(model):
+    """Normalize model labels to a canonical set."""
+    if pd.isna(model):
+        return np.nan
+    raw = str(model).strip()
+    key = raw.lower().replace(" ", "").replace("-", "_")
+    return MODEL_ALIASES.get(key, raw)
+
+def get_available_model_order(data):
+    """Return available models in canonical order."""
+    present = set(data["model"].dropna().astype(str).tolist())
+    return [model for model in MODEL_ORDER if model in present]
+
+def effective_moving_average_window(n_points, requested_window):
+    """Pick a valid moving-average window even for smaller per-model subsets."""
+    if n_points < 2:
+        return None
+    if n_points >= requested_window:
+        return int(requested_window)
+    return max(2, n_points // 3)
+
+def select_statistics_subset(data):
+    """
+    Keep one model's rows for statistics plots to avoid repeated trial-level values.
+    Returns (subset_dataframe, selected_model_name_or_none).
+    """
+    available_models = get_available_model_order(data)
+    if not available_models:
+        return data.copy(), None
+    selected_model = available_models[0]
+    subset = data[data["model"] == selected_model].copy()
+    return subset, selected_model
+
 def plot_metric_vs_parameter(data, save_path, x_column, y_column, title, x_label, y_label,
                              window=50, y_lim=None, log_x=False, log_x_if_range=False,
-                             corr_log_x=None, log_x_range_threshold=10):
+                             corr_log_x=None, log_x_range_threshold=10, color_by_model=False):
     """Generic scatter + moving-average plot with Pearson correlation annotation."""
     fig, ax = plt.subplots(figsize=(7, 6))
 
     y_series = pd.to_numeric(data[y_column], errors='coerce')
-    x_series = data[x_column]
+    x_series = pd.to_numeric(data[x_column], errors='coerce')
     x, y = prepare_xy(x_series, y_series)
-
-    # Create scatter plot with default seaborn blue dots
-    ax.scatter(x, y, alpha=0.3, s=20)
 
     # Decide whether to use log scale on x-axis
     use_log = log_x
@@ -123,6 +162,36 @@ def plot_metric_vs_parameter(data, save_path, x_column, y_column, title, x_label
         max_x = np.max(x)
         if min_x > 0 and (max_x / min_x) > log_x_range_threshold:
             use_log = True
+
+    # Scatter and trendline drawing
+    model_order = get_available_model_order(data)
+    plotted_models = []
+    if color_by_model and model_order:
+        for model_name in model_order:
+            model_mask = data["model"] == model_name
+            x_m = pd.to_numeric(data.loc[model_mask, x_column], errors='coerce')
+            y_m = pd.to_numeric(data.loc[model_mask, y_column], errors='coerce')
+            x_model, y_model = prepare_xy(x_m, y_m)
+            if len(x_model) == 0:
+                continue
+
+            color = MODEL_COLORS.get(model_name, None)
+            ax.scatter(x_model, y_model, alpha=0.28, s=20, color=color, label=model_name)
+
+            eff_window = effective_moving_average_window(len(x_model), window)
+            if eff_window is not None:
+                x_ma, y_ma = moving_average(np.array(x_model), np.array(y_model), window=eff_window)
+                if len(x_ma) > 0:
+                    ax.plot(x_ma, y_ma, color=color, linestyle='--', linewidth=2.0)
+            plotted_models.append(model_name)
+    else:
+        # Default single-color plotting path
+        ax.scatter(x, y, alpha=0.3, s=20, color='tab:blue')
+        eff_window = effective_moving_average_window(len(x), window)
+        if eff_window is not None:
+            x_ma, y_ma = moving_average(np.array(x), np.array(y), window=eff_window)
+            if len(x_ma) > 0:
+                ax.plot(x_ma, y_ma, color='navy', linestyle='--', linewidth=2)
 
     # Calculate Pearson correlation
     if corr_log_x is None:
@@ -142,11 +211,6 @@ def plot_metric_vs_parameter(data, save_path, x_column, y_column, title, x_label
     else:
         corr, p_value = np.nan, np.nan
 
-    # Add moving average trend line with specified window
-    x_ma, y_ma = moving_average(np.array(x), np.array(y), window=window)
-    if len(x_ma) > 0:
-        ax.plot(x_ma, y_ma, color='navy', linestyle='--', linewidth=2)
-
     # Add title
     ax.set_title(title, fontsize=18.5, pad=20)
 
@@ -165,6 +229,17 @@ def plot_metric_vs_parameter(data, save_path, x_column, y_column, title, x_label
     if use_log:
         ax.set_xscale('log')
 
+    if plotted_models:
+        legend_handles = [
+            Patch(
+                facecolor=MODEL_COLORS.get(model_name, 'gray'),
+                edgecolor='none',
+                label=model_name,
+            )
+            for model_name in plotted_models
+        ]
+        ax.legend(handles=legend_handles, title='Model', loc='best')
+
     # Remove top and right spines
     sns.despine()
 
@@ -176,7 +251,8 @@ def plot_metric_vs_parameter(data, save_path, x_column, y_column, title, x_label
     print(f"Generated {save_path}")
 
 def plot_pds_vs_parameter(data, save_path, x_column, title, x_label,
-                          window=50, pds_metric=None, log_x=False, log_x_if_range=False):
+                          window=50, pds_metric=None, log_x=False, log_x_if_range=False,
+                          color_by_model=True):
     """Plot PDS vs a parameter with a moving average trend line."""
     if pds_metric is None:
         pds_metric = resolve_pds_metric(data)
@@ -194,12 +270,14 @@ def plot_pds_vs_parameter(data, save_path, x_column, title, x_label,
         y_lim=(0.0, 1.1),
         log_x=log_x,
         log_x_if_range=log_x_if_range,
+        color_by_model=color_by_model,
     )
 
 def plot_pearson_delta_vs_parameter(data, save_path, x_column, title, x_label,
                                     window=50, y_column='pearson',
                                     y_label=r'Median Pearson$(\Delta^{pred},\Delta^{obs})$',
-                                    log_x=False, log_x_if_range=False, corr_log_x=None):
+                                    log_x=False, log_x_if_range=False, corr_log_x=None,
+                                    color_by_model=True):
     """Plot Pearson delta vs a parameter with a moving average trend line."""
     plot_metric_vs_parameter(
         data=data,
@@ -214,9 +292,10 @@ def plot_pearson_delta_vs_parameter(data, save_path, x_column, title, x_label,
         log_x=log_x,
         log_x_if_range=log_x_if_range,
         corr_log_x=corr_log_x,
+        color_by_model=color_by_model,
     )
 
-def plot_sparsity(
+def plot_statistics(
     data,
     save_path,
     column='sparsity',
@@ -295,9 +374,30 @@ def main():
     
     try:
         # Load data from the specified results file
-        data = load_data(args.results)
+        data = pd.read_csv(args.results)
+        data = data.copy()
+        data["model"] = data["model"].apply(normalize_model_name)
+        data = data[data['status'] == 'success'].copy()
+
+        # add a new comlumn for the absolute difference between vendi_scrore_pred and vendi_score_obs
+        data['vendi_score_diff'] = np.abs(data['vendi_score_pred'] - data['vendi_score_obs'])
+
+        performance_data = data.copy()
+        model_order = get_available_model_order(performance_data)
+        if model_order:
+            performance_data = performance_data[performance_data['model'].isin(model_order)].copy()
+        print(
+            f"Performance plotting rows: {len(performance_data)} "
+            f"(models: {model_order if model_order else 'not available'})"
+        )
+
+        statistics_data, statistics_model = select_statistics_subset(performance_data)
+        if statistics_model is not None:
+            print(f"Statistics plots use model '{statistics_model}' only ({len(statistics_data)} rows).")
+        else:
+            print(f"Statistics plots use all available rows ({len(statistics_data)} rows).")
         
-        window = 100
+        window = 20
         
         # Define save paths for all plots
         plot_dir = 'results/synthetic_simulations/paper_plots'
@@ -306,7 +406,7 @@ def main():
         # Generate all plots
         # Plot Pearson delta vs control bias (β)
         plot_pearson_delta_vs_parameter(
-            data=data,
+            data=performance_data,
             save_path=os.path.join(plot_dir, 'pearson_delta_vs_control_bias.pdf'),
             x_column='B',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{β}$  $\mathbf{(Simulation)}$',
@@ -316,7 +416,7 @@ def main():
         )
         # Plot Pearson delta vs n0
         plot_pearson_delta_vs_parameter(
-            data=data,
+            data=performance_data,
             save_path=os.path.join(plot_dir, 'pearson_delta_vs_n0.pdf'),
             x_column='N0',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{n_0}$ $\mathbf{(Simulation)}$',
@@ -325,22 +425,20 @@ def main():
             log_x=True,
             corr_log_x=True,
         )
-        # Plot Pearson delta (affected genes) vs number of perturbations.
+        # Plot Pearson delta vs number of perturbations
         plot_pearson_delta_vs_parameter(
-            data=data,
-            save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_perturbations.pdf'),
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'pearson_delta_vs_perturbations.pdf'),
             x_column='P',
-            y_column='pearson_degs',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{k}$ $\mathbf{(Simulation)}$',
             x_label='Number of Perturbations ($k$)',
-            y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
             window=window,
             log_x_if_range=True,
             corr_log_x=True,
         )
         # Plot Pearson delta vs sparsity
         plot_pearson_delta_vs_parameter(
-            data=data,
+            data=performance_data,
             save_path=os.path.join(plot_dir, 'pearson_delta_vs_sparsity.pdf'),
             x_column='sparsity',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Sparsity}$  $\mathbf{(Simulation)}$',
@@ -351,7 +449,7 @@ def main():
         )
         # Plot Pearson delta vs systematic variation
         plot_pearson_delta_vs_parameter(
-            data=data,
+            data=performance_data,
             save_path=os.path.join(plot_dir, 'pearson_delta_vs_systematic_variation.pdf'),
             x_column='systematic_variation',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Systematic}$ $\mathbf{Variation}$  $\mathbf{(Simulation)}$',
@@ -362,7 +460,7 @@ def main():
         )
         # Plot Pearson delta vs intra-data correlation
         plot_pearson_delta_vs_parameter(
-            data=data,
+            data=performance_data,
             save_path=os.path.join(plot_dir, 'pearson_delta_vs_intra_corr.pdf'),
             x_column='intra_corr',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Intra}$-$\mathbf{data}$ $\mathbf{Correlation}$  $\mathbf{(Simulation)}$',
@@ -373,7 +471,7 @@ def main():
         )
         # Plot Pearson delta vs vendi score
         plot_pearson_delta_vs_parameter(
-            data=data,
+            data=performance_data,
             save_path=os.path.join(plot_dir, 'pearson_delta_vs_vendi_score.pdf'),
             x_column='vendi_score',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Vendi}$ $\mathbf{Score}$  $\mathbf{(Simulation)}$',
@@ -382,10 +480,319 @@ def main():
             log_x=False,
             corr_log_x=False,
         )
+        # Plot Pearson delta (affected genes) vs control bias (β)
+        plot_pearson_delta_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_control_bias.pdf'),
+            x_column='B',
+            y_column='pearson_true_degs',
+            title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{(Affected}$ $\mathbf{Genes)}$ $\mathbf{by}$ $\mathbf{β}$  $\mathbf{(Simulation)}$',
+            x_label='Control Bias (β)',
+            y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
+            window=window,
+            corr_log_x=False,
+        )
+        # Plot Pearson delta (affected genes) vs n0
+        plot_pearson_delta_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_n0.pdf'),
+            x_column='N0',
+            y_column='pearson_true_degs',
+            title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{(Affected}$ $\mathbf{Genes)}$ $\mathbf{by}$ $\mathbf{n_0}$  $\mathbf{(Simulation)}$',
+            x_label='Number of Control Cells ($n_0$)',
+            y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
+            window=window,
+            log_x=True,
+            corr_log_x=True,
+        )
+        # Plot Pearson delta (affected genes) vs number of perturbations.
+        plot_pearson_delta_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_perturbations.pdf'),
+            x_column='P',
+            y_column='pearson_true_degs',
+            title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{k}$ $\mathbf{(Simulation)}$',
+            x_label='Number of Perturbations ($k$)',
+            y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
+            window=window,
+            log_x_if_range=True,
+            corr_log_x=True,
+        )
+        # Plot Pearson delta (affected genes) vs sparsity.
+        plot_pearson_delta_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_sparsity.pdf'),
+            x_column='sparsity',
+            y_column='pearson_true_degs',
+            title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Sparsity}$ $\mathbf{(Simulation)}$',
+            x_label='Sparsity',
+            y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
+            window=window,
+            log_x=False,
+            corr_log_x=False,
+        )
+        # Plot Pearson delta (affected genes) vs systematic variation.
+        plot_pearson_delta_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_systematic_variation.pdf'),
+            x_column='systematic_variation',
+            y_column='pearson_true_degs',
+            title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Systematic}$ $\mathbf{Variation}$ $\mathbf{(Simulation)}$',
+            x_label='Systematic Variation',
+            y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
+            window=window,
+            log_x=False,
+            corr_log_x=False,
+        )
+        # Plot Pearson delta (affected genes) vs intra-data correlation.
+        plot_pearson_delta_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_intra_corr.pdf'),
+            x_column='intra_corr',
+            y_column='pearson_true_degs',
+            title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Intra}$-$\mathbf{data}$ $\mathbf{Correlation}$ $\mathbf{(Simulation)}$',
+            x_label='Intra-data Correlation',
+            y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
+            window=window,
+            log_x=False,
+            corr_log_x=False,
+        )
+        # Plot Pearson delta (affected genes) vs vendi score.
+        plot_pearson_delta_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_vendi_score.pdf'),
+            x_column='vendi_score',
+            y_column='pearson_true_degs',
+            title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Vendi}$ $\mathbf{Score}$ $\mathbf{(Simulation)}$',
+            x_label='Vendi Score',
+            y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
+            window=window,
+            log_x=False,
+            corr_log_x=False,
+        )
+        # plot vendi score diff vs control bias (β)
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'vendi_score_diff_vs_control_bias.pdf'),
+            x_column='B',
+            y_column='vendi_score_diff',
+            title=r'Vendi Score Difference by $\beta$',
+            x_label='Control Bias (β)',
+            y_label='Absolute Difference in Vendi Score',
+            window=window,
+            color_by_model=True,
+        )
+        # plot vendi score diff vs n0
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'vendi_score_diff_vs_n0.pdf'),
+            x_column='N0',
+            y_column='vendi_score_diff',
+            title=r'Vendi Score Difference by $n_0$',
+            x_label='Number of Control Cells ($n_0$)',
+            y_label='Absolute Difference in Vendi Score',
+            window=window,
+            log_x=True,
+            color_by_model=True,
+        )
+        # plot vendi score diff vs number of perturbations
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'vendi_score_diff_vs_perturbations.pdf'),
+            x_column='P',
+            y_column='vendi_score_diff',
+            title=r'Vendi Score Difference by Number of Perturbations',
+            x_label='Number of Perturbations ($k$)',
+            y_label='Absolute Difference in Vendi Score',
+            window=window,
+            color_by_model=True,
+        )
+        # plot vendi score diff vs sparsity
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'vendi_score_diff_vs_sparsity.pdf'),
+            x_column='sparsity',
+            y_column='vendi_score_diff',
+            title=r'Vendi Score Difference by Sparsity',
+            x_label='Sparsity',
+            y_label='Absolute Difference in Vendi Score',
+            window=window,
+            color_by_model=True,
+        )
+        # plot vendi score diff vs systematic variation
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'vendi_score_diff_vs_systematic_variation.pdf'),
+            x_column='systematic_variation',
+            y_column='vendi_score_diff',
+            title=r'Vendi Score Difference by Systematic Variation',
+            x_label='Systematic Variation',
+            y_label='Absolute Difference in Vendi Score',
+            window=window,
+            color_by_model=True,
+        )
+        # plot vendi score diff vs intra-data correlation
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'vendi_score_diff_vs_intra_corr.pdf'),
+            x_column='intra_corr',
+            y_column='vendi_score_diff',
+            title=r'Vendi Score Difference by Intra-data Correlation',
+            x_label='Intra-data Correlation',
+            y_label='Absolute Difference in Vendi Score',
+            window=window,
+            color_by_model=True,
+        )
+        # r2 vs control bias (β)
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_vs_control_bias.pdf'),
+            x_column='B',
+            y_column='r2',
+            title=r'$R^2$ by $\beta$',
+            x_label='Control Bias (β)',
+            y_label=r'$R^2$',
+            window=window,
+            color_by_model=True,
+        )
+        # r2 vs n0
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_vs_n0.pdf'),
+            x_column='N0',
+            y_column='r2',
+            title=r'$R^2$ by $n_0$',
+            x_label='Number of Control Cells ($n_0$)',
+            y_label=r'$R^2$',
+            window=window,
+            log_x=True,
+            color_by_model=True,
+        )
+        # r2 vs number of perturbations
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_vs_perturbations.pdf'),
+            x_column='P',
+            y_column='r2',
+            title=r'$R^2$ by Number of Perturbations',
+            x_label='Number of Perturbations ($k$)',
+            y_label=r'$R^2$',
+            window=window,
+            color_by_model=True,
+        )
+        # r2 vs sparsity
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_vs_sparsity.pdf'),
+            x_column='sparsity',
+            y_column='r2',
+            title=r'$R^2$ by Sparsity',
+            x_label='Sparsity',
+            y_label=r'$R^2$',
+            window=window,
+            color_by_model=True,
+        )
+        # r2 vs systematic variation
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_vs_systematic_variation.pdf'),
+            x_column='systematic_variation',
+            y_column='r2',
+            title=r'$R^2$ by Systematic Variation',
+            x_label='Systematic Variation',
+            y_label=r'$R^2$',
+            window=window,
+            color_by_model=True,
+        )
+        # r2 vs intra-data correlation
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_vs_intra_corr.pdf'),
+            x_column='intra_corr',
+            y_column='r2',
+            title=r'$R^2$ by Intra-data Correlation',
+            x_label='Intra-data Correlation',
+            y_label=r'$R^2$',
+            window=window,
+            color_by_model=True,
+        )
+        # r2 (affected genes) vs control bias (β)
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_degs_vs_control_bias.pdf'),
+            x_column='B',
+            y_column='r2_true_degs',
+            title=r'$R^2$ by Control Bias',
+            x_label='Control Bias (β)',
+            y_label=r'$R^2$',
+            window=window,
+            color_by_model=True,
+        )
+        # r2 (affected genes) vs n0
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_degs_vs_n0.pdf'),
+            x_column='N0',
+            y_column='r2_true_degs',
+            title=r'$R^2$ by Number of Control Cells',
+            x_label='Number of Control Cells ($n_0$)',
+            y_label=r'$R^2$',
+            window=window,
+            log_x=True,
+            color_by_model=True,
+        )
+        # r2 (affected genes) vs number of perturbations
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_degs_vs_perturbations.pdf'),
+            x_column='P',
+            y_column='r2_true_degs',
+            title=r'$R^2$ by Number of Perturbations',
+            x_label='Number of Perturbations ($k$)',
+            y_label=r'$R^2$',
+            window=window,
+            color_by_model=True,
+        )
+        # r2 (affected genes) vs sparsity
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_degs_vs_sparsity.pdf'),
+            x_column='sparsity',
+            y_column='r2_true_degs',
+            title=r'$R^2$ by Sparsity',
+            x_label='Sparsity',
+            y_label=r'$R^2$',
+            window=window,
+            color_by_model=True,
+        )
+        # r2 (affected genes) vs systematic variation
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_degs_vs_systematic_variation.pdf'),
+            x_column='systematic_variation',
+            y_column='r2_true_degs',
+            title=r'$R^2$ by Systematic Variation',
+            x_label='Systematic Variation',
+            y_label=r'$R^2$',
+            window=window,
+            color_by_model=True,
+        )
+        # r2 (affected genes) vs intra-data correlation
+        plot_metric_vs_parameter(
+            data=performance_data,
+            save_path=os.path.join(plot_dir, 'r2_degs_vs_intra_corr.pdf'),
+            x_column='intra_corr',
+            y_column='r2_true_degs',
+            title=r'$R^2$ by Intra-data Correlation',
+            x_label='Intra-data Correlation',
+            y_label=r'$R^2$',
+            window=window,
+            color_by_model=True,
+        )
         for pds_metric in ['pds_cosine', 'pds_l2', 'pds_l1']:
             # Plot PDS vs control bias (β)
             plot_pds_vs_parameter(
-                data=data,
+                data=performance_data,
                 save_path=os.path.join(plot_dir, f'{pds_metric}_vs_control_bias.pdf'),
                 x_column='B',
                 title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{β}$  $\mathbf{(Simulation)}$',
@@ -396,7 +803,7 @@ def main():
             )
             # Plot PDS vs N0 (number of control cells)
             plot_pds_vs_parameter(
-                data=data,
+                data=performance_data,
                 save_path=os.path.join(plot_dir, f'{pds_metric}_vs_n0.pdf'),
                 x_column='N0',
                 title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{n_0}$ $\mathbf{(Simulation)}$',
@@ -407,7 +814,7 @@ def main():
             )
             # Plot PDS vs number of perturbations
             plot_pds_vs_parameter(
-                data=data,
+                data=performance_data,
                 save_path=os.path.join(plot_dir, f'{pds_metric}_vs_perturbations.pdf'),
                 x_column='P',
                 title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{k}$ $\mathbf{(Simulation)}$',
@@ -418,7 +825,7 @@ def main():
             )
             # Plot PDS vs sparsity
             plot_pds_vs_parameter(
-                data=data,
+                data=performance_data,
                 save_path=os.path.join(plot_dir, f'{pds_metric}_vs_sparsity.pdf'),
                 x_column='sparsity',
                 title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{Sparsity}$  $\mathbf{(Simulation)}$',
@@ -429,7 +836,7 @@ def main():
             )
             # Plot PDS vs systematic variation
             plot_pds_vs_parameter(
-                data=data,
+                data=performance_data,
                 save_path=os.path.join(plot_dir, f'{pds_metric}_vs_systematic_variation.pdf'),
                 x_column='systematic_variation',
                 title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{Systematic}$ $\mathbf{Variation}$  $\mathbf{(Simulation)}$',
@@ -440,7 +847,7 @@ def main():
             )
             # Plot PDS vs intra-data correlation
             plot_pds_vs_parameter(
-                data=data,
+                data=performance_data,
                 save_path=os.path.join(plot_dir, f'{pds_metric}_vs_intra_corr.pdf'),
                 x_column='intra_corr',
                 title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{Intra}$-$\mathbf{data}$ $\mathbf{Correlation}$  $\mathbf{(Simulation)}$',
@@ -451,7 +858,7 @@ def main():
             )
             # Plot PDS vs vendi score
             plot_pds_vs_parameter(
-                data=data,
+                data=performance_data,
                 save_path=os.path.join(plot_dir, f'{pds_metric}_vs_vendi_score.pdf'),
                 x_column='vendi_score',
                 title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{Vendi}$ $\mathbf{Score}$  $\mathbf{(Simulation)}$',
@@ -469,11 +876,11 @@ def main():
             ('vendi_score', 'vendi_score.pdf', 'Vendi Score', False),
         ]
         for column, filename, label, use_log_x in histogram_specs:
-            if column not in data.columns:
+            if column not in statistics_data.columns:
                 print(f"Skipping histogram for '{column}': column not found.")
                 continue
-            plot_sparsity(
-                data=data,
+            plot_statistics(
+                data=statistics_data,
                 save_path=os.path.join(plot_dir, filename),
                 column=column,
                 x_label=label,
@@ -482,7 +889,7 @@ def main():
             )
         # Plot MSE vs p_effect (fraction of genes affected)
         plot_metric_vs_parameter(
-            data=data,
+            data=performance_data,
             save_path=os.path.join(plot_dir, 'mse_vs_p_effect.pdf'),
             x_column='p_effect',
             y_column='mse',
@@ -490,11 +897,12 @@ def main():
             x_label=r'Perturbation Probability ($\delta$)',
             y_label='MSE',
             window=window,
+            color_by_model=True,
         )
 
         # plot systematic variation vs intra-data correlation
         plot_metric_vs_parameter(
-            data=data,
+            data=statistics_data,
             save_path=os.path.join(plot_dir, 'systematic_variation_vs_intra_corr.pdf'),
             x_column='systematic_variation',
             y_column='intra_corr',
@@ -506,7 +914,7 @@ def main():
 
         # plot systematic variation vs vendi score
         plot_metric_vs_parameter(
-            data=data,
+            data=statistics_data,
             save_path=os.path.join(plot_dir, 'systematic_variation_vs_vendi_score.pdf'),
             x_column='systematic_variation',
             y_column='vendi_score',
@@ -518,7 +926,7 @@ def main():
 
         # plot vendi score vs P
         plot_metric_vs_parameter(
-            data=data,
+            data=statistics_data,
             save_path=os.path.join(plot_dir, 'vendi_score_vs_perturbations.pdf'),
             x_column='P',
             y_column='vendi_score',
