@@ -1,4 +1,6 @@
 from __future__ import annotations
+from typing import Any
+
 from scipy import sparse
 from scipy import stats
 import numpy as np
@@ -7,6 +9,35 @@ import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 
 from util.anndata_util import get_matrix
+
+
+def _to_vector(x: Any) -> np.ndarray:
+    arr = np.asarray(x)
+    if arr.ndim > 1:
+        arr = arr.ravel()
+    return arr
+
+
+def compute_means_by_perturbation(
+    adata_view,
+    perturbation_ids: np.ndarray,
+    layer_key: str | None,
+    perturbation_key: str = "perturbation",
+    missing_group_context: str | None = None,
+) -> np.ndarray:
+    """Compute per-perturbation mean expression vectors from an AnnData-like view."""
+    means = np.empty((perturbation_ids.size, adata_view.n_vars), dtype=np.float32)
+    labels = adata_view.obs[perturbation_key].to_numpy(dtype=np.int32, copy=False)
+    context_suffix = f" in {missing_group_context}" if missing_group_context else ""
+
+    for idx, pert_id in enumerate(perturbation_ids):
+        pert_mask = labels == int(pert_id)
+        if int(np.sum(pert_mask)) == 0:
+            raise ValueError(f"No cells found for perturbation id {int(pert_id)}{context_suffix}.")
+        matrix = get_matrix(adata_view[pert_mask, :], layer_key=layer_key)
+        means[idx, :] = _to_vector(matrix.mean(axis=0)).astype(np.float32, copy=False)
+    return means
+
 
 
 def est_cost(params):

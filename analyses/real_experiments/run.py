@@ -14,20 +14,16 @@ from scipy import sparse
 
 from analyses.context_splitter import ContextSplitter
 from analyses.evaluator import evaluation, get_eval_perturbation_ids
-from analyses.synthetic_simulations.util import get_pseudobulks_and_degs
+from analyses.synthetic_simulations.util import (
+    compute_means_by_perturbation,
+    get_pseudobulks_and_degs,
+)
 from models.linear import PseudoPCALinear
 from models.scvi_pert import ScviPerturbation
-from util.anndata_util import get_matrix, AnnDataProxy
+from util.anndata_util import AnnDataProxy
 
 _MODELS = ["Control", "Average", "linearPCA", "scVI"]
 _NORM_LAYER_KEY = "normalized_log1p"
-
-
-def _to_vector(x: Any) -> np.ndarray:
-    arr = np.asarray(x)
-    if arr.ndim > 1:
-        arr = arr.ravel()
-    return arr
 
 
 def _encode_perturbations(
@@ -112,24 +108,6 @@ def load_real_dataset(
     )
     return adata, label_mapping
 
-
-def compute_means_by_perturbation(
-    adata_view: ad.AnnData,
-    perturbation_ids: np.ndarray,
-    layer_key: str | None,
-) -> np.ndarray:
-    means = np.empty((perturbation_ids.size, adata_view.n_vars), dtype=np.float32)
-    labels = adata_view.obs["perturbation"].to_numpy(dtype=np.int32, copy=False)
-
-    for idx, pert_id in enumerate(perturbation_ids):
-        pert_mask = labels == int(pert_id)
-        if int(np.sum(pert_mask)) == 0:
-            raise ValueError(f"No cells found for perturbation id {int(pert_id)} in evaluation view.")
-        matrix = get_matrix(adata_view[pert_mask, :], layer_key=layer_key)
-        means[idx, :] = _to_vector(matrix.mean(axis=0)).astype(np.float32, copy=False)
-    return means
-
-
 def _build_perturbation_label_map(adata: ad.AnnData) -> dict[int, str]:
     pairs = adata.obs[["perturbation", "perturbation_original"]].drop_duplicates()
     return {
@@ -213,7 +191,6 @@ def run_one_trial(
     cell_line_key: str,
     counts_layer: str | None,
     obs_layer: str | None,
-    deg_alpha: float,
 ) -> list[dict[str, Any]]:
     train_idx, val_idx, test_idx = splitter.split(seed=trial_id)
 
@@ -241,7 +218,7 @@ def run_one_trial(
     mu_control_test, mu_pool_test, degs_test = get_pseudobulks_and_degs(
         ac_view=ad_test_eval,
         return_degs=True,
-        alpha=float(deg_alpha),
+        alpha=0.05,
         method="t-test",
         layer_key=obs_layer,
     )
@@ -250,6 +227,7 @@ def run_one_trial(
         adata_view=ad_test_eval,
         perturbation_ids=test_perturbation_ids,
         layer_key=obs_layer,
+        missing_group_context="evaluation view",
     )
     train_perturbation_ids = get_eval_perturbation_ids(obs=ad_train_val, control_label=-1, strict_match=False)
     train_perturbation_ids = np.asarray(train_perturbation_ids, dtype=np.int32)
@@ -260,6 +238,7 @@ def run_one_trial(
         adata_view=ad_train_val,
         perturbation_ids=train_perturbation_ids,
         layer_key=obs_layer,
+        missing_group_context="evaluation view",
     )
     pert_id_to_label = _build_perturbation_label_map(adata)
     gene_name_set = set(adata.var_names.astype(str))
@@ -387,7 +366,6 @@ def run_real_experiments(
     counts_layer: str | None,
     obs_layer: str | None,
     split_strategy: str,
-    deg_alpha: float,
     norm_target_sum: float,
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
@@ -457,7 +435,6 @@ def run_real_experiments(
     if dataset_name == "norman19":
         # Can only do in-context split
         context_mode = None
-        donor_key = "donor"
         holdout_context_values = None
     elif dataset_name == "replogle22":
         if split_strategy == "in-context":
@@ -503,14 +480,12 @@ def run_real_experiments(
                 cell_line_key=cell_line_key,
                 counts_layer=counts_layer,
                 obs_layer=obs_layer,
-                deg_alpha=deg_alpha,
             )
             for row in trial_rows:
                 row.update(
                     {
                         "dataset": dataset_name,
                         "dataset_path": dataset_path,
-                        "deg_alpha": deg_alpha,
                         "n_cells": int(adata.n_obs),
                         "n_genes": int(adata.n_vars),
                         "n_cell_lines": n_cell_lines,
@@ -526,7 +501,6 @@ def run_real_experiments(
                 "trial_id": int(trial_id),
                 "status": "failed",
                 "error": str(exc),
-                "deg_alpha": deg_alpha,
                 "n_cells": int(adata.n_obs),
                 "n_genes": int(adata.n_vars),
                 "n_cell_lines": n_cell_lines,
@@ -585,7 +559,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--norm_target_sum", type=float, default=1e4, help="Target sum for normalization when obs_layer is missing and needs to be computed from counts.")
 
     parser.add_argument("--split_strategy", type=str, default="in-context", choices=["in-context", "cross-context"])
-    parser.add_argument("--deg_alpha", type=float, default=0.05)
     return parser.parse_args()
 
 
@@ -606,7 +579,6 @@ def main() -> None:
         counts_layer=counts_layer,
         obs_layer=obs_layer,
         split_strategy=args.split_strategy,
-        deg_alpha=args.deg_alpha,
         norm_target_sum=float(args.norm_target_sum),
     )
 

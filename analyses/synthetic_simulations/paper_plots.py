@@ -469,17 +469,6 @@ def main():
             log_x=False,
             corr_log_x=False,
         )
-        # Plot Pearson delta vs vendi score
-        plot_pearson_delta_vs_parameter(
-            data=performance_data,
-            save_path=os.path.join(plot_dir, 'pearson_delta_vs_vendi_score.pdf'),
-            x_column='vendi_score',
-            title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Vendi}$ $\mathbf{Score}$  $\mathbf{(Simulation)}$',
-            x_label='Vendi Score',
-            window=window,
-            log_x=False,
-            corr_log_x=False,
-        )
         # Plot Pearson delta (affected genes) vs control bias (β)
         plot_pearson_delta_vs_parameter(
             data=performance_data,
@@ -552,19 +541,6 @@ def main():
             y_column='pearson_true_degs',
             title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Intra}$-$\mathbf{data}$ $\mathbf{Correlation}$ $\mathbf{(Simulation)}$',
             x_label='Intra-data Correlation',
-            y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
-            window=window,
-            log_x=False,
-            corr_log_x=False,
-        )
-        # Plot Pearson delta (affected genes) vs vendi score.
-        plot_pearson_delta_vs_parameter(
-            data=performance_data,
-            save_path=os.path.join(plot_dir, 'pearson_delta_degs_vs_vendi_score.pdf'),
-            x_column='vendi_score',
-            y_column='pearson_true_degs',
-            title=r'$\mathbf{Pearson(Δ)}$ $\mathbf{by}$ $\mathbf{Vendi}$ $\mathbf{Score}$ $\mathbf{(Simulation)}$',
-            x_label='Vendi Score',
             y_label=r'Median Pearson$(\Delta^{p},\Delta^{all})$ (Affected genes)',
             window=window,
             log_x=False,
@@ -852,17 +828,6 @@ def main():
                 x_column='intra_corr',
                 title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{Intra}$-$\mathbf{data}$ $\mathbf{Correlation}$  $\mathbf{(Simulation)}$',
                 x_label='Intra-data Correlation',
-                window=window,
-                pds_metric=pds_metric,
-                log_x=False,
-            )
-            # Plot PDS vs vendi score
-            plot_pds_vs_parameter(
-                data=performance_data,
-                save_path=os.path.join(plot_dir, f'{pds_metric}_vs_vendi_score.pdf'),
-                x_column='vendi_score',
-                title=r'$\mathbf{PDS}$ $\mathbf{by}$ $\mathbf{Vendi}$ $\mathbf{Score}$  $\mathbf{(Simulation)}$',
-                x_label='Vendi Score',
                 window=window,
                 pds_metric=pds_metric,
                 log_x=False,
