@@ -7,6 +7,7 @@ import numpy as np
 import anndata as ad
 from anndata.experimental import AnnCollection
 from umap import UMAP
+from scipy import sparse
 from .synthetic_two import synthetic_causalDGP
 from metrics.reconstruction.vendi_score import vendi_score
 
@@ -71,12 +72,22 @@ def _plot_umap_for_single_perturbation(
     plt.close(fig)
 
 
+def _compute_sparsity(matrix) -> tuple[int, int, float]:
+    total_entries = int(matrix.shape[0] * matrix.shape[1])
+    if sparse.issparse(matrix):
+        nonzero_entries = int(matrix.nnz)
+    else:
+        nonzero_entries = int(np.count_nonzero(np.asarray(matrix)))
+    sparsity = 1.0 - (nonzero_entries / total_entries) if total_entries > 0 else float("nan")
+    return total_entries, nonzero_entries, sparsity
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate synthetic causal DGP data and plot UMAP by cell line per perturbation."
     )
     parser.add_argument("--output-dir", type=str, default="results/other_plots", help="Directory for generated chunks and UMAP figures.")
-    parser.add_argument("--G", type=int, default=150, help="Number of genes.")
+    parser.add_argument("--G", type=int, default=2048, help="Number of genes.")
     parser.add_argument("--N0", type=int, default=2048, help="Number of control cells.")
     parser.add_argument("--Nk", type=int, default=2048, help="Number of cells per perturbation.")
     parser.add_argument("--P", type=int, default=5, help="Number of perturbations.")
@@ -95,6 +106,7 @@ def main() -> None:
 
     all_params_df = pd.read_csv("results/synthetic_simulations/parameter_estimation/all_fitted_params.csv", index_col=0)
     all_theta = all_params_df['n'].values
+    all_mu = all_params_df['mu'].values
 
     # Keep this demo fixed at P=5 as requested.
     chunk_paths, all_affected_masks = synthetic_causalDGP(
@@ -104,9 +116,10 @@ def main() -> None:
         P=args.P,
         mu_l=args.mu_l,
         all_theta=all_theta,
+        all_mu=all_mu,
+        output_dir=str(output_dir),
         swap_fraction=args.swap_fraction,
         seed=args.seed,
-        output_dir=str(output_dir),
         mask_method="power-law",
         diversity_type=args.diversity_type,
         max_cells_per_chunk=args.max_cells_per_chunk,
@@ -121,6 +134,13 @@ def main() -> None:
     print(f"Vendi score for the dataset: {vendi_score(ac, layer_key=args.normalized_layer_key)}")
 
     adata = ad.concat(adatas, axis=0, join="outer", merge="same", index_unique=None)
+
+    # sparsity
+    count_matrix = adata.layers["counts"] if "counts" in adata.layers else adata.X
+    total_entries, nonzero_entries, sparsity = _compute_sparsity(count_matrix)
+    print(f"Total entries: {total_entries}")
+    print(f"Non-zero entries: {nonzero_entries}")
+    print(f"Sparsity of the dataset: {sparsity:.4f}")
 
     required_obs = {"cell_line", "perturbation"}
     missing_obs = required_obs.difference(adata.obs.columns)

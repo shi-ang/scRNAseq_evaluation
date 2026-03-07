@@ -329,21 +329,22 @@ class EMSampler:
 
 
 def synthetic_causalDGP(
-    G=10_000,   # number of genes
-    N0=3_000,   # number of control cells
-    Nk=150,     # number of perturbed cells per perturbation
-    P=50,       # number of perturbations
-    mu_l=1.0,   # mean of log library size
-    all_theta=None, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
-    mask_method: str = "Erdos-Renyi", # Erdos-Renyi or Power-law
-    diversity_type: str = "A", # Whether to create diversity by perturbing A or b, three options: "A", "b", "both"
-    swap_fraction: float = 0.8,  # row-wise fraction of A edges rewired for A_alter
-    seed=None, # Optional for seeding RNG per trial
-    output_dir=None, # Directory to persist temporary chunked h5ad files
-    max_cells_per_chunk=2048,
-    normalize=True, # Whether to normalize before log1p for the persisted layer
-    normalized_layer_key: str = "normalized_log1p", # Layer name for normalized/log1p values
-    visualize=False, # Whether to visualize the A matrix and its spectrum for debugging
+    G: int,
+    N0: int,
+    Nk: int,
+    P: int,
+    mu_l: float,
+    all_theta: np.ndarray,
+    all_mu: np.ndarray,
+    output_dir: str,
+    mask_method: str = "Erdos-Renyi",
+    diversity_type: str = "A",
+    swap_fraction: float = 0.8,
+    seed: int = None,
+    max_cells_per_chunk: int = 2048,
+    normalize: bool = True,
+    normalized_layer_key: str = "normalized_log1p",
+    visualize: bool = False,
 ) -> Tuple[list[str], list[np.ndarray]]:
     """
     End-to-end synthetic scRNA-seq generator:
@@ -353,6 +354,24 @@ def synthetic_causalDGP(
     Observation model (ZIP):
         y_g = 0 w.p. pi_g
         else y_g ~ Poisson( eta_g * softplus(x_g) )
+
+    Arguments:
+        - G: number of genes
+        - N0: number of control cells
+        - Nk: number of perturbed cells per perturbation
+        - P: number of perturbations
+        - mu_l: mean of log library size (log-normal parameters for per-cell library size variability)
+        - all_theta: array of theta (dispersion) parameters for all genes in the real dataset, used to set the negative binomial dispersion in the synthetic data
+        - all_mu: array of mu (mean) parameters for all genes in the real dataset, used to set the overall expression level and gene-gene variability in the synthetic data
+        - output_dir: directory to write chunked .h5ad files with synthetic data
+        - mask_method: method for generating the base causal matrix A (Erdos-Renyi or Power-law)
+        - diversity_type: whether to create diversity by perturbing A or b or both, options: "A", "b", "both"
+        - swap_fraction: row-wise fraction of A edges rewired to create A_alter for diversity
+        - seed: optional seed for RNG to ensure reproducibility
+        - max_cells_per_chunk: chunk size for writing .h5ad files to manage memory
+        - normalize: whether to add a normalized/log1p layer in the output .h5
+        - normalized_layer_key: layer name for the normalized/log1p values in the output .h5ad files
+        - visualize: whether to visualize the generated A, b, and c matrices for sanity check
 
     Outputs chunked .h5ad files:
       - .X: raw counts (CSR, int32)
@@ -366,10 +385,6 @@ def synthetic_causalDGP(
     """
     rng = np.random.default_rng(42 if seed is None else seed)
 
-    if output_dir is None:
-        raise ValueError("output_dir must be provided.")
-    if all_theta is None:
-        raise ValueError("all_theta must be provided.")
     if G <= 0:
         raise ValueError(f"G must be positive, got {G}")
     if N0 < 0 or Nk < 0 or P < 0:
@@ -383,12 +398,18 @@ def synthetic_causalDGP(
             f"swap_fraction must be in [0, 1], got {swap_fraction}"
         )
 
+    assert isinstance(all_mu, np.ndarray), "all_mu must be a numpy array"
+    assert isinstance(all_theta, np.ndarray), "all_theta must be a numpy array"
+    # Assert that they have the same length
+    assert len(all_mu) == len(all_theta), "all_mu and all_theta must have the same length."
+    # Assert that G is not larger than the provided arrays
+    assert len(all_mu) >= G, f"G parameter ({G}) cannot be larger than the length of provided arrays ({len(all_mu)})"
+    
     # Sample G elements from all_theta
-    all_theta = np.asarray(all_theta, dtype=np.float32).reshape(-1)
-    if all_theta.size < G:
-        raise ValueError(f"all_theta must have length >= G ({G}), got {all_theta.size}")
-    indices = rng.choice(all_theta.size, size=G, replace=False)
-    local_all_theta = np.maximum(all_theta[indices], 1e-6).astype(np.float32, copy=False)
+    indices = rng.choice(len(all_mu), size=G, replace=False)
+    local_all_mu = all_mu[indices]
+    mu_sum = local_all_mu.sum()
+    local_all_theta = all_theta[indices]  # Use the all-cells theta
 
     # Build shift function f_q(x) = Ax + b + c_q.
     A = _build_base_matrix(G=G, rng=rng, mask_method=mask_method)
@@ -586,6 +607,7 @@ def synthetic_causalDGP(
             mu_batch_sum = mu_batch.sum(axis=1, keepdims=True, dtype=np.float32)
             mu_batch_sum[mu_batch_sum <= 0.0] = 1.0
             mu_batch = mu_batch / mu_batch_sum
+            mu_batch = mu_batch * mu_sum * 1.0
 
             lib_size_pert = rng.lognormal(
                 mean=mu_l, sigma=0.1714, size=current_batch_size

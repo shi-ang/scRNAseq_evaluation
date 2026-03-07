@@ -1,4 +1,5 @@
 import argparse
+import gc
 import numpy as np
 import pandas as pd
 import os
@@ -42,8 +43,29 @@ _PARAM_RANGES = {
     'B': {'type': 'float', 'min': 0.0, 'max': 2.0}, # 0.0, 2.0, beta
     'mu_l': {'type': 'float', 'min': 0.2, 'max': 5.0} # 0.2, 5.0, mu_l
 }
-_MODELS = ["Control", "Average", "linearPCA", "scVI"]
+_MODELS = ["Control"]
 _NORM_LAYER_KEY = "normalized_log1p"
+
+
+def _close_memmap(array: np.memmap | None) -> None:
+    if array is None:
+        return
+    try:
+        array.flush()
+    except Exception:
+        pass
+    mmap_obj = getattr(array, "_mmap", None)
+    if mmap_obj is not None:
+        mmap_obj.close()
+
+
+def _get_trial_temp_root() -> str | None:
+    for env_key in ("DBD_TMPDIR", "SLURM_TMPDIR", "TMPDIR"):
+        candidate = os.environ.get(env_key)
+        if candidate:
+            return candidate
+    return None
+
 
 def _has_known_target(tokens: tuple[str, ...], gene_name_set: set[str]) -> bool:
     return any(token in gene_name_set for token in tokens)
@@ -51,20 +73,20 @@ def _has_known_target(tokens: tuple[str, ...], gene_name_set: set[str]) -> bool:
 
 def simulate_one_run(
     dataset_name: str,
-    G: int=10_000,   # number of genes
-    N0: int=3_000,   # number of control cells
-    Nk: int=150,     # number of perturbed cells per perturbation
-    P: int=50,       # number of perturbations
-    p_effect: float=0.01,  # a threshold for fraction of genes affected per perturbation
-    effect_factor: float=2.0,  # effect factor for affected genes, epsilon in the paper
-    B: float=0.0,      # global perturbation bias factor, beta in the paper
-    mu_l: float=1.0,   # mean of log library size
-    diversity_type: str="A", # Type of diversity to introduce for synthetic_two dataset ("A", "b", "both", or "none")
-    all_theta: np.ndarray | None = None, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
-    control_mu: np.ndarray | None = None, # Control mu parameters, size of total number of genes in the real dataset (>= G)
-    pert_mu: np.ndarray | None = None, # Perturbed mu parameters, size of total number of genes in the real dataset (>= G)
+    G: int,   # number of genes
+    N0: int,   # number of control cells
+    Nk: int,     # number of perturbed cells per perturbation
+    P: int,       # number of perturbations
+    p_effect: float,  # a threshold for fraction of genes affected per perturbation
+    effect_factor: float,  # effect factor for affected genes, epsilon in the paper
+    B: float,      # global perturbation bias factor, beta in the paper
+    mu_l: float,   # mean of log library size
+    diversity_type: str, # Type of diversity to introduce for synthetic_two dataset ("A", "b", "both", or "none")
+    all_theta: np.ndarray, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
+    control_mu: np.ndarray, # Control mu parameters, size of total number of genes in the real dataset (>= G)
+    pert_mu: np.ndarray, # Perturbed mu parameters, size of total number of genes in the real dataset (>= G)
+    all_mu: np.ndarray, # All-cells mu parameters, size of total number of genes in the real dataset (>= G)
     trial_id_for_rng: int | None = None, # Optional for seeding RNG per trial,
-    model: str="Average", # The prediction model to use
     normalize: bool=True, # Whether to normalize the data
     max_cells_per_chunk: int=2048, # Count-generation chunk size
     ann_batch_size: int=1024, # AnnCollection batch size for scanpy processing
@@ -81,7 +103,12 @@ def simulate_one_run(
 
     # Setup temporary directory for chunked data
     # The directory and its contents will be deleted after use
-    with tempfile.TemporaryDirectory(prefix=f"synthetic_trial_{trial_id_for_rng}_", dir="/tmp") as tmp_dir:
+    tmp_dir_kwargs = {"prefix": f"synthetic_trial_{trial_id_for_rng}_"}
+    temp_root = _get_trial_temp_root()
+    if temp_root is not None:
+        tmp_dir_kwargs["dir"] = temp_root
+
+    with tempfile.TemporaryDirectory(**tmp_dir_kwargs) as tmp_dir:
         if dataset_name == "synthetic_one":
             chunk_paths, affected_genes = synthetic_DGP(
                 G=G,
@@ -109,6 +136,7 @@ def simulate_one_run(
                 P=P,
                 mu_l=mu_l,
                 all_theta=all_theta,
+                all_mu=all_mu,
                 mask_method='Power-law',
                 diversity_type=diversity_type,
                 swap_fraction=0.8,
@@ -154,8 +182,13 @@ def simulate_one_run(
         current_idx = 0
 
         # Read chunk files lazily and iterate in observation batches.
-        backed_chunks = [ad.read_h5ad(path, backed="r") for path in chunk_paths]
+        backed_chunks: list[ad.AnnData] = []
+        collection = None
+        ac_test_only = None
+        ac_train_val = None
+        ac_test_eval = None
         try:
+            backed_chunks = [ad.read_h5ad(path, backed="r") for path in chunk_paths]
             collection = AnnCollection(
                 backed_chunks,
                 join_vars="inner",
@@ -204,226 +237,230 @@ def simulate_one_run(
                     pert_sumsq[perturbation_id, :] += subset_sumsq.astype(np.float32, copy=False)
                     pert_counts[perturbation_id] += subset_count
                     pool_sum += subset_sum
+            # Basic sanity checks before proceeding with metric calculations
+            assert control_count == N0, f"Control cell count mismatch: expected {N0}, got {control_count}"
+            assert pert_counts.sum() == Nk * P, f"Perturbed cell count mismatch: expected {Nk * P}, got {pert_counts.sum()}"
+
+            # Compute control mean and perturbed mean
+            mu_control = (control_sum / N0).astype(np.float32, copy=False)
+            mu_pool = (pool_sum / (Nk * P)).astype(np.float32, copy=False)
+
+            # Compute observed means per perturbation
+            mu_obs = np.empty((P, G), dtype=np.float32)
+            for p_idx in range(P):
+                mu_pert_float64 = pert_sum[p_idx, :].astype(np.float64, copy=False) / pert_counts[p_idx]
+                mu_obs[p_idx, :] = mu_pert_float64.astype(np.float32, copy=False)
+
+            sparsity = 1.0 - (total_nonzero / total_entries)
+            median_library_size = np.nanmedian(library_sizes[:current_idx]) if current_idx > 0 else np.nan
+
+            sys_var = systematic_variation(
+                ptb_shifts=mu_obs - mu_control,
+                avg_ptb_shift=mu_pool - mu_control,
+            )
+            intra_corr = intra_correlation(mu_obs - mu_control)
+            vs = vendi_score(
+                ac=collection,
+                ac_batch_size=ann_batch_size,
+                n_pca_components=30,
+                sample_size=2_000,
+                random_state=0 if trial_id_for_rng is None else int(trial_id_for_rng),
+                layer_key=_NORM_LAYER_KEY,
+            )
+
+            data_stats = {
+                'sparsity': sparsity,
+                'median_library_size': median_library_size,
+                'systematic_variation': sys_var,
+                'intra_corr': intra_corr,
+                'vendi_score': vs,
+            }
+
+            # Split indices 
+            proxy = AnnDataProxy(collection.obs)
+            splitter = ContextSplitter(
+                adata=proxy,
+                train_frac=0.7,
+                val_frac=0.1,
+                test_frac=0.2,
+                context_mode="cell" if split_strategy == "cross-context" else None,
+                perturbation_key="perturbation",
+                cell_line_key="cell_line",
+                donor_key="donor",
+                holdout_context_values=[1] if split_strategy == "cross-context" else None,
+                control_label=-1,
+            )
+            train_idx, val_idx, test_idx = splitter.split(seed=trial_id_for_rng)
+
+            # Additional checks to ensure splits contain expected perturbations and control cells
+            labels = collection.obs["perturbation"].to_numpy(dtype=np.int32, copy=False)
+            control_train_idx = train_idx[labels[train_idx] == -1]
+            if control_train_idx.size == 0:
+                raise ValueError("No control cells found in training split.")
+
+            ac_test_only = collection[test_idx]
+            test_perturbation_ids = get_eval_perturbation_ids(
+                obs=ac_test_only,
+                control_label=-1,
+                strict_match=False,
+            )
+            test_perturbation_ids = np.asarray(test_perturbation_ids, dtype=np.int32)
+            if test_perturbation_ids.size == 0:
+                raise ValueError("No non-control perturbations found in test split.")
+
+            train_val_idx = np.concatenate([train_idx, val_idx])
+            test_eval_idx = np.concatenate([control_train_idx, test_idx])
+            ac_train_val = collection[train_val_idx]
+            ac_test_eval = collection[test_eval_idx]
+
+            mu_control_train, mu_pool_train, _ = get_pseudobulks_and_degs(
+                ac_view=ac_train_val,
+                ac_batch_size=ann_batch_size,
+                return_degs=False,
+                layer_key=_NORM_LAYER_KEY,
+            )
+
+            mu_control_test, mu_pool_test, degs_test = get_pseudobulks_and_degs(
+                ac_view=ac_test_eval,
+                ac_batch_size=ann_batch_size,
+                return_degs=True,
+                alpha=p_effect, #TODO: check this
+                method="t-test",
+                layer_key=_NORM_LAYER_KEY,
+            )
+            train_perturbation_ids = get_eval_perturbation_ids(
+                obs=ac_train_val,
+                control_label=-1,
+                strict_match=False,
+            )
+            train_perturbation_ids = np.asarray(train_perturbation_ids, dtype=np.int32)
+            if train_perturbation_ids.size == 0:
+                raise ValueError("No non-control perturbations found in train/val split.")
+
+            mu_train = compute_means_by_perturbation(
+                adata_view=ac_train_val,
+                perturbation_ids=train_perturbation_ids,
+                layer_key=_NORM_LAYER_KEY,
+            )
+            mu_obs_test = compute_means_by_perturbation(
+                adata_view=ac_test_eval,
+                perturbation_ids=test_perturbation_ids,
+                layer_key=_NORM_LAYER_KEY,
+            )
+
+            gene_names = np.asarray(collection.var_names).astype(str)
+            gene_name_set = set(gene_names)
+            n_genes = int(gene_names.size)
+            train_targets = [(f"gene_{int(pid) % n_genes}",) for pid in train_perturbation_ids]
+            test_targets = [(f"gene_{int(pid) % n_genes}",) for pid in test_perturbation_ids]
+
+            all_results = []
+            for model in _MODELS:
+                start_time = time.time()
+                mu_pred = None
+                ad_test_pred = None
+                if model == "Control":
+                    mu_pred = np.tile(mu_control_train, (test_perturbation_ids.size, 1))
+                elif model == "Average":
+                    mu_pred = np.tile(mu_pool_train, (test_perturbation_ids.size, 1))
+                elif model == "linearPCA":
+                    # Fallback for unsupported perturbations is Average baseline.
+                    mu_pred = np.tile(mu_pool_train, (test_perturbation_ids.size, 1))
+
+                    train_valid_mask = np.array(
+                        [_has_known_target(tokens, gene_name_set) for tokens in train_targets],
+                        dtype=bool,
+                    )
+                    test_valid_mask = np.array(
+                        [_has_known_target(tokens, gene_name_set) for tokens in test_targets],
+                        dtype=bool,
+                    )
+
+                    if np.any(train_valid_mask) and np.any(test_valid_mask):
+                        train_targets_valid = [train_targets[i] for i in np.flatnonzero(train_valid_mask)]
+                        test_targets_valid = [test_targets[i] for i in np.flatnonzero(test_valid_mask)]
+                        n_train_valid = int(np.sum(train_valid_mask))
+                        n_test_valid = int(np.sum(test_valid_mask))
+
+                        linear_input = np.vstack(
+                            [
+                                mu_train[train_valid_mask, :],
+                                np.zeros((n_test_valid, int(collection.n_vars)), dtype=np.float64),
+                            ]
+                        )
+                        linear_targets = [*train_targets_valid, *test_targets_valid]
+                        train_idx_linear = np.arange(n_train_valid, dtype=int)
+                        test_idx_linear = np.arange(n_train_valid, n_train_valid + n_test_valid, dtype=int)
+
+                        linear_model = PseudoPCALinear(
+                            pseudobulk=linear_input,
+                            target_genes=linear_targets,
+                            gene_names=gene_names,
+                            train_idx=train_idx_linear,
+                            test_idx=test_idx_linear,
+                            seed=trial_id_for_rng if trial_id_for_rng is not None else 42,
+                        )
+                        mu_pred_valid = linear_model.run()
+                        mu_pred[test_valid_mask, :] = mu_pred_valid
+                elif model == "scVI":
+                    scvi_model = ScviPerturbation(
+                        data=collection,
+                        counts_layer="counts",
+                        perturbation_key="perturbation", # NOTE: check if this is useful
+                        train_idx=train_idx,
+                        val_idx=val_idx,
+                        test_idx=test_idx,
+                        seed=trial_id_for_rng if trial_id_for_rng is not None else 42,
+                    )
+                    ad_test_pred = scvi_model.run(
+                        n_latent=10,
+                        n_hidden=128,
+                        n_layers=3,
+                        gene_likelihood="zinb",
+                        dispersion="gene",
+                        max_epochs=800,
+                        batch_size=512,
+                        early_stopping=True,
+                        dataloader_num_workers=0,
+                    )
+                else:
+                    raise NotImplementedError(f"Model '{model}' is not implemented.")
+
+                # model_results = evaluation(
+                #     pred=ad_test_pred,
+                #     obs=ac_test_eval,
+                #     mu_pred=mu_pred,
+                #     mu_obs=mu_obs_test,
+                #     mu_control_obs=mu_control_test,
+                #     mu_pool_obs=mu_pool_test,
+                #     true_DEGs=affected_genes,
+                #     DEGs_stats=degs_test,
+                #     perturbation_ids=test_perturbation_ids,
+                #     model=model,
+                #     layer_obs=_NORM_LAYER_KEY,
+                #     control_label=-1,
+                # )
+                model_results = {}
+
+                model_results.update({
+                    'model': model,
+                    'execution_time': time.time() - start_time,
+                    **data_stats
+                })
+                all_results.append(model_results)
+
+            return all_results
         finally:
-            # even if we error out, make sure to close the open file handles for backed AnnData objects
+            ac_test_eval = None
+            ac_train_val = None
+            ac_test_only = None
+            collection = None
             for backed_adata in backed_chunks:
                 if getattr(backed_adata, "file", None) is not None:
                     backed_adata.file.close()
-
-        # Basic sanity checks before proceeding with metric calculations
-        assert control_count == N0, f"Control cell count mismatch: expected {N0}, got {control_count}"
-        assert pert_counts.sum() == Nk * P, f"Perturbed cell count mismatch: expected {Nk * P}, got {pert_counts.sum()}"
-
-        # Compute control mean and perturbed mean
-        mu_control = (control_sum / N0).astype(np.float32, copy=False)
-        mu_pool = (pool_sum / (Nk * P)).astype(np.float32, copy=False)
-
-        # Compute observed means per perturbation
-        mu_obs = np.empty((P, G), dtype=np.float32)
-        for p_idx in range(P):
-            mu_pert_float64 = pert_sum[p_idx, :].astype(np.float64, copy=False) / pert_counts[p_idx]
-            mu_obs[p_idx, :] = mu_pert_float64.astype(np.float32, copy=False)
-
-        sparsity = 1.0 - (total_nonzero / total_entries)
-        median_library_size = np.nanmedian(library_sizes[:current_idx]) if current_idx > 0 else np.nan
-
-        sys_var = systematic_variation(
-            ptb_shifts=mu_obs - mu_control,
-            avg_ptb_shift=mu_pool - mu_control,
-        )
-        intra_corr = intra_correlation(mu_obs - mu_control)
-        vs = vendi_score(
-            ac=collection,
-            ac_batch_size=ann_batch_size,
-            n_pca_components=30,
-            sample_size=2_000,
-            random_state=0 if trial_id_for_rng is None else int(trial_id_for_rng),
-            layer_key=_NORM_LAYER_KEY,
-        )
-
-        data_stats = {
-            'sparsity': sparsity,
-            'median_library_size': median_library_size,
-            'systematic_variation': sys_var,
-            'intra_corr': intra_corr,
-            'vendi_score': vs,
-        }
-
-        # Split indices 
-        proxy = AnnDataProxy(collection.obs)
-        splitter = ContextSplitter(
-            adata=proxy,
-            train_frac=0.7,
-            val_frac=0.1,
-            test_frac=0.2,
-            context_mode="cell" if split_strategy == "cross-context" else None,
-            perturbation_key="perturbation",
-            cell_line_key="cell_line",
-            donor_key="donor",
-            holdout_context_values=[1] if split_strategy == "cross-context" else None,
-            control_label=-1,
-        )
-        train_idx, val_idx, test_idx = splitter.split(seed=trial_id_for_rng)
-
-        # Additional checks to ensure splits contain expected perturbations and control cells
-        labels = collection.obs["perturbation"].to_numpy(dtype=np.int32, copy=False)
-        control_train_idx = train_idx[labels[train_idx] == -1]
-        if control_train_idx.size == 0:
-            raise ValueError("No control cells found in training split.")
-
-        ac_test_only = collection[test_idx]
-        test_perturbation_ids = get_eval_perturbation_ids(
-            obs=ac_test_only,
-            control_label=-1,
-            strict_match=False,
-        )
-        test_perturbation_ids = np.asarray(test_perturbation_ids, dtype=np.int32)
-        if test_perturbation_ids.size == 0:
-            raise ValueError("No non-control perturbations found in test split.")
-
-        train_val_idx = np.concatenate([train_idx, val_idx])
-        test_eval_idx = np.concatenate([control_train_idx, test_idx])
-        ac_train_val = collection[train_val_idx]
-        ac_test_eval = collection[test_eval_idx]
-
-        mu_control_train, mu_pool_train, _ = get_pseudobulks_and_degs(
-            ac_view=ac_train_val,
-            ac_batch_size=ann_batch_size,
-            return_degs=False,
-            layer_key=_NORM_LAYER_KEY,
-        )
-
-        mu_control_test, mu_pool_test, degs_test = get_pseudobulks_and_degs(
-            ac_view=ac_test_eval,
-            ac_batch_size=ann_batch_size,
-            return_degs=True,
-            alpha=p_effect, #TODO: check this
-            method="t-test",
-            layer_key=_NORM_LAYER_KEY,
-        )
-        train_perturbation_ids = get_eval_perturbation_ids(
-            obs=ac_train_val,
-            control_label=-1,
-            strict_match=False,
-        )
-        train_perturbation_ids = np.asarray(train_perturbation_ids, dtype=np.int32)
-        if train_perturbation_ids.size == 0:
-            raise ValueError("No non-control perturbations found in train/val split.")
-
-        mu_train = compute_means_by_perturbation(
-            adata_view=ac_train_val,
-            perturbation_ids=train_perturbation_ids,
-            layer_key=_NORM_LAYER_KEY,
-        )
-        mu_obs_test = compute_means_by_perturbation(
-            adata_view=ac_test_eval,
-            perturbation_ids=test_perturbation_ids,
-            layer_key=_NORM_LAYER_KEY,
-        )
-
-        gene_names = np.asarray(collection.var_names).astype(str)
-        gene_name_set = set(gene_names)
-        n_genes = int(gene_names.size)
-        train_targets = [(f"gene_{int(pid) % n_genes}",) for pid in train_perturbation_ids]
-        test_targets = [(f"gene_{int(pid) % n_genes}",) for pid in test_perturbation_ids]
-
-        all_results = []
-        for model in _MODELS:
-            start_time = time.time()
-            mu_pred = None
-            ad_test_pred = None
-            if model == "Control":
-                mu_pred = np.tile(mu_control_train, (test_perturbation_ids.size, 1))
-            elif model == "Average":
-                mu_pred = np.tile(mu_pool_train, (test_perturbation_ids.size, 1))
-            elif model == "linearPCA":
-                # Fallback for unsupported perturbations is Average baseline.
-                mu_pred = np.tile(mu_pool_train, (test_perturbation_ids.size, 1))
-
-                train_valid_mask = np.array(
-                    [_has_known_target(tokens, gene_name_set) for tokens in train_targets],
-                    dtype=bool,
-                )
-                test_valid_mask = np.array(
-                    [_has_known_target(tokens, gene_name_set) for tokens in test_targets],
-                    dtype=bool,
-                )
-
-                if np.any(train_valid_mask) and np.any(test_valid_mask):
-                    train_targets_valid = [train_targets[i] for i in np.flatnonzero(train_valid_mask)]
-                    test_targets_valid = [test_targets[i] for i in np.flatnonzero(test_valid_mask)]
-                    n_train_valid = int(np.sum(train_valid_mask))
-                    n_test_valid = int(np.sum(test_valid_mask))
-
-                    linear_input = np.vstack(
-                        [
-                            mu_train[train_valid_mask, :],
-                            np.zeros((n_test_valid, int(collection.n_vars)), dtype=np.float64),
-                        ]
-                    )
-                    linear_targets = [*train_targets_valid, *test_targets_valid]
-                    train_idx_linear = np.arange(n_train_valid, dtype=int)
-                    test_idx_linear = np.arange(n_train_valid, n_train_valid + n_test_valid, dtype=int)
-
-                    linear_model = PseudoPCALinear(
-                        pseudobulk=linear_input,
-                        target_genes=linear_targets,
-                        gene_names=gene_names,
-                        train_idx=train_idx_linear,
-                        test_idx=test_idx_linear,
-                        seed=trial_id_for_rng if trial_id_for_rng is not None else 42,
-                    )
-                    mu_pred_valid = linear_model.run()
-                    mu_pred[test_valid_mask, :] = mu_pred_valid
-            elif model == "scVI":
-                scvi_model = ScviPerturbation(
-                    data=collection,
-                    counts_layer="counts",
-                    perturbation_key="perturbation", # NOTE: check if this is useful
-                    train_idx=train_idx,
-                    val_idx=val_idx,
-                    test_idx=test_idx,
-                    seed=trial_id_for_rng if trial_id_for_rng is not None else 42,
-                )
-                ad_test_pred = scvi_model.run(
-                    n_latent=10,
-                    n_hidden=128,
-                    n_layers=3,
-                    gene_likelihood="zinb",
-                    dispersion="gene",
-                    max_epochs=800,
-                    batch_size=512,
-                    early_stopping=True,
-                    dataloader_num_workers=0,
-                )
-            else:
-                raise NotImplementedError(f"Model '{model}' is not implemented.")
-
-            model_results = evaluation(
-                pred=ad_test_pred,
-                obs=ac_test_eval,
-                mu_pred=mu_pred,
-                mu_obs=mu_obs_test,
-                mu_control_obs=mu_control_test,
-                mu_pool_obs=mu_pool_test,
-                true_DEGs=affected_genes,
-                DEGs_stats=degs_test,
-                perturbation_ids=test_perturbation_ids,
-                model=model,
-                layer_obs=_NORM_LAYER_KEY,
-                control_label=-1,
-            )
-
-            print(model_results)
-
-            model_results.update({
-                'model': model,
-                'execution_time': time.time() - start_time,
-                **data_stats
-            })
-            all_results.append(model_results)
-
-        return all_results
+            _close_memmap(pert_sum)
+            _close_memmap(pert_sumsq)
+            gc.collect()
 
 
 def sample_parameters(param_ranges): # Unchanged from original
@@ -442,10 +479,11 @@ def sample_parameters(param_ranges): # Unchanged from original
             params[param] = range_info['value']
     return params
 
-def init_worker(control_mu, all_theta, pert_mu):
+def init_worker(control_mu, all_theta, pert_mu, all_mu):
     _GLOBAL["control_mu"] = control_mu
     _GLOBAL["all_theta"] = all_theta
     _GLOBAL["pert_mu"] = pert_mu
+    _GLOBAL["all_mu"] = all_mu
 
 # Revised _pool_worker to include timing (matches spirit of original)
 def _pool_worker_timed(task_info_dict):
@@ -457,6 +495,7 @@ def _pool_worker_timed(task_info_dict):
     control_mu_from_main = _GLOBAL["control_mu"]
     all_theta_from_main  = _GLOBAL["all_theta"]
     pert_mu_from_main    = _GLOBAL["pert_mu"]
+    all_mu_from_main    = _GLOBAL["all_mu"]
 
     # Add trial_id for RNG seeding within simulate_one_run_numpy
     params_for_sim = params_dict.copy() # Avoid modifying original params_dict
@@ -467,7 +506,7 @@ def _pool_worker_timed(task_info_dict):
     params_for_sim['control_mu'] = control_mu_from_main
     params_for_sim['all_theta'] = all_theta_from_main
     params_for_sim['pert_mu'] = pert_mu_from_main
-    
+    params_for_sim['all_mu'] = all_mu_from_main
     try:
         # Ensure all required keys by simulate_one_run_numpy are in params_for_sim
         # G, N0, Nk, P, p_effect, effect_factor are expected from sample_parameters
@@ -518,6 +557,7 @@ def run_random_sweep(
     control_mu=None,
     all_theta=None,
     pert_mu=None,
+    all_mu=None,
     num_workers=None,
     use_multiprocessing=True,
     max_cells_per_chunk=2048,
@@ -559,7 +599,7 @@ def run_random_sweep(
         with ctx.Pool(
             processes=num_workers, 
             initializer=init_worker, 
-            initargs=(control_mu, all_theta, pert_mu),
+            initargs=(control_mu, all_theta, pert_mu, all_mu),
             maxtasksperchild=100,
         ) as pool:
             print("\nProcessing trials (AnnData-backed version with worker timing):")
@@ -568,7 +608,7 @@ def run_random_sweep(
                     all_results_data += result_from_worker
                     pbar.update(1)
     else:
-        init_worker(control_mu, all_theta, pert_mu)
+        init_worker(control_mu, all_theta, pert_mu, all_mu)
         print("\nProcessing trials (AnnData-backed version with worker timing):")
         with tqdm(total=n_trials, desc="Running Trials (AnnData-backed)") as pbar:
             for task in tasks_for_pool:
@@ -647,6 +687,7 @@ if __name__ == "__main__":
     # Extract parameters for simulation
     control_mu = control_params_df['mu'].values
     pert_mu = perturbed_params_df['mu'].values
+    all_mu = all_params_df['mu'].values
     
     # Use theta (n) from all cells estimation
     all_theta = all_params_df['n'].values
@@ -662,6 +703,7 @@ if __name__ == "__main__":
         control_mu=control_mu, 
         all_theta=all_theta,
         pert_mu=pert_mu,
+        all_mu=all_mu,
         diversity_type=args.diversity_type,
         num_workers=args.num_workers, # num_worker should be around 0.6 * RAM / MAX_SPACE_PER_WORK
         use_multiprocessing=args.multiprocessing,

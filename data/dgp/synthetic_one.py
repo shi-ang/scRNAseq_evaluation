@@ -6,19 +6,19 @@ from .util import ChunkedAnnDataWriter, sample_nb_counts
 
 
 def synthetic_DGP(
-    G=10_000,   # number of genes
-    N0=3_000,   # number of control cells
-    Nk=150,     # number of perturbed cells per perturbation
-    P=50,       # number of perturbations
-    p_effect=0.01,  # a threshold for fraction of genes affected per perturbation
-    effect_factor=2.0,  # effect factor for affected genes, epsilon in the paper
-    B=0.0,      # global perturbation bias factor, beta in the paper
-    mu_l=1.0,   # mean of log library size
-    all_theta=None, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
-    control_mu=None, # Control mu parameters, size of total number of genes in the real dataset (>= G)
-    pert_mu=None, # Perturbed mu parameters, size of total number of genes in the real dataset (>= G)
+    G,   # number of genes
+    N0,   # number of control cells
+    Nk,     # number of perturbed cells per perturbation
+    P,       # number of perturbations
+    p_effect,  # a threshold for fraction of genes affected per perturbation
+    effect_factor,  # effect factor for affected genes, epsilon in the paper
+    B,      # global perturbation bias factor, beta in the paper
+    mu_l,   # mean of log library size
+    all_theta, # Theta parameter for all cells , size of total number of genes in the real dataset (>= G)
+    control_mu, # Control mu parameters, size of total number of genes in the real dataset (>= G)
+    pert_mu, # Perturbed mu parameters, size of total number of genes in the real dataset (>= G)
+    output_dir, # Directory to persist temporary chunked h5ad files
     seed=None, # Optional for seed,
-    output_dir=None, # Directory to persist temporary chunked h5ad files
     max_cells_per_chunk=2048,
     normalize=True, # Whether to normalize before log1p for the persisted layer
     normalized_layer_key: str = "normalized_log1p", # Layer name for normalized/log1p values
@@ -32,16 +32,9 @@ def synthetic_DGP(
       - chunk_paths: list[str], h5ad files containing sparse count chunks
       - all_affected_masks: list[np.ndarray], one mask per perturbation
     """
-    if seed is None:
-        rng = np.random.default_rng(42)
-    else:
-        rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(42 if seed is None else seed)
     
     # --- Parameter Preparation with assertions ---
-    # Assert that control_mu, pert_mu, and all_theta are provided
-    assert control_mu is not None, "control_mu must be provided. None value is not allowed."
-    assert pert_mu is not None, "pert_mu must be provided. None value is not allowed."
-    assert all_theta is not None, "all_theta must be provided. None value is not allowed."
     # Assert that inputs are already arrays
     assert isinstance(control_mu, np.ndarray), "control_mu must be a numpy array"
     assert isinstance(pert_mu, np.ndarray), "pert_mu must be a numpy array"
@@ -60,9 +53,6 @@ def synthetic_DGP(
     local_pert_mu = pert_mu[indices]
 
     var = pd.DataFrame(index=pd.Index([f"gene_{i}" for i in range(G)], name="gene"))
-
-    if output_dir is None:
-        raise ValueError("output_dir must be provided.")
 
     all_affected_masks = []
     writer = ChunkedAnnDataWriter(
